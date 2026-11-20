@@ -85,6 +85,23 @@ pub struct CopilotCredential {
 struct CachedCredential {
     credential: CopilotCredential,
     refresh_at: Instant,
+    expires_at: SystemTime,
+    expires_monotonic: Instant,
+}
+
+impl CachedCredential {
+    fn is_valid(&self) -> bool {
+        Instant::now() < self.expires_monotonic && SystemTime::now() < self.expires_at
+    }
+}
+
+enum ExchangeFailure {
+    Transient(anyhow::Error),
+    Permanent(anyhow::Error),
+}
+
+fn is_transient_transport(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_body()
 }
 
 /// A concurrency-safe, lazily refreshed Copilot token cache.
@@ -112,10 +129,10 @@ impl GitHubAuth {
 
     /// Environment takes precedence over the existing upstream-compatible file.
     pub fn resolve_github_token(&self) -> Result<Option<String>> {
-        if let Ok(value) = std::env::var("COPILOT_API_GITHUB_TOKEN") {
-            if !value.trim().is_empty() {
-                return Ok(Some(value.trim().to_owned()));
-            }
+        if let Ok(value) = std::env::var("COPILOT_API_GITHUB_TOKEN")
+            && !value.trim().is_empty()
+        {
+            return Ok(Some(value.trim().to_owned()));
         }
         let path = github_token_path()?;
         match std::fs::read_to_string(path) {
@@ -181,27 +198,27 @@ impl GitHubAuth {
                 Ok(response) => response,
                 Err(_) => bail!("GitHub device authorization expired; sign in again"),
             };
-            if let Ok(response) = response {
-                if response.status().is_success() {
-                    let result: PollResponse = tokio::time::timeout_at(
-                        deadline.into(),
-                        parse_json(response, "GitHub device authorization"),
-                    )
-                    .await
-                    .map_err(|_| anyhow!("GitHub device authorization expired; sign in again"))??;
-                    if let Some(token) = result.access_token.filter(|s| !s.is_empty()) {
-                        return Ok(token);
+            if let Ok(response) = response
+                && response.status().is_success()
+            {
+                let result: PollResponse = tokio::time::timeout_at(
+                    deadline.into(),
+                    parse_json(response, "GitHub device authorization"),
+                )
+                .await
+                .map_err(|_| anyhow!("GitHub device authorization expired; sign in again"))??;
+                if let Some(token) = result.access_token.filter(|s| !s.is_empty()) {
+                    return Ok(token);
+                }
+                match result.error.as_deref() {
+                    Some("slow_down") => {
+                        interval = interval.saturating_add(5).max(result.interval.unwrap_or(0))
                     }
-                    match result.error.as_deref() {
-                        Some("slow_down") => {
-                            interval = interval.saturating_add(5).max(result.interval.unwrap_or(0))
-                        }
-                        Some("authorization_pending") | None => {}
-                        Some(error) => bail!(
-                            "GitHub device authorization failed: {}",
-                            result.error_description.as_deref().unwrap_or(error)
-                        ),
-                    }
+                    Some("authorization_pending") | None => {}
+                    Some(error) => bail!(
+                        "GitHub device authorization failed: {}",
+                        result.error_description.as_deref().unwrap_or(error)
+                    ),
                 }
             }
             let delay = Duration::from_secs(interval.saturating_add(1));
@@ -224,11 +241,33 @@ impl CopilotAuth {
 
     pub async fn credential(&self) -> Result<CopilotCredential> {
         let mut cache = self.cached.lock().await;
-        if let Some(cached) = cache.as_ref() {
-            if Instant::now() < cached.refresh_at {
-                return Ok(cached.credential.clone());
-            }
+        if let Some(cached) = cache.as_ref()
+            && cached.is_valid()
+            && Instant::now() < cached.refresh_at
+        {
+            return Ok(cached.credential.clone());
         }
+        match self.exchange().await {
+            Ok(new) => {
+                let credential = new.credential.clone();
+                *cache = Some(new);
+                Ok(credential)
+            }
+            Err(ExchangeFailure::Transient(error)) => {
+                if let Some(cached) = cache.as_mut() {
+                    // A request can itself take long enough for the old token to expire.
+                    if cached.is_valid() {
+                        cached.refresh_at = Instant::now() + Duration::from_secs(5);
+                        return Ok(cached.credential.clone());
+                    }
+                }
+                Err(error)
+            }
+            Err(ExchangeFailure::Permanent(error)) => Err(error),
+        }
+    }
+
+    async fn exchange(&self) -> std::result::Result<CachedCredential, ExchangeFailure> {
         let response = self
             .auth
             .client
@@ -242,8 +281,43 @@ impl CopilotAuth {
             .header("x-vscode-user-agent-library-version", "electron-fetch")
             .send()
             .await
-            .context("exchanging GitHub token for Copilot token")?;
-        let response: ExchangeResponse = parse_json(response, "Copilot token exchange").await?;
+            .map_err(|error| {
+                let transient = is_transient_transport(&error);
+                let error = anyhow!(error).context("exchanging GitHub token for Copilot token");
+                if transient {
+                    ExchangeFailure::Transient(error)
+                } else {
+                    ExchangeFailure::Permanent(error)
+                }
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let error = anyhow!("Copilot token exchange returned HTTP {status}");
+            return Err(if status.as_u16() == 429 || status.is_server_error() {
+                ExchangeFailure::Transient(error)
+            } else {
+                ExchangeFailure::Permanent(error)
+            });
+        }
+        let response: ExchangeResponse = parse_json(response, "Copilot token exchange")
+            .await
+            .map_err(|error| {
+                let transient = error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(is_transient_transport)
+                });
+                if transient {
+                    ExchangeFailure::Transient(error)
+                } else {
+                    ExchangeFailure::Permanent(error)
+                }
+            })?;
+        self.cache_response(response)
+            .map_err(ExchangeFailure::Permanent)
+    }
+
+    fn cache_response(&self, response: ExchangeResponse) -> Result<CachedCredential> {
         if response.token.is_empty() {
             bail!("Copilot returned an empty token");
         }
@@ -252,31 +326,35 @@ impl CopilotAuth {
             .and_then(|e| e.api)
             .unwrap_or_else(|| "https://api.githubcopilot.com".into());
         let api_base = trusted_copilot_endpoint(&api)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before epoch")?
-            .as_secs();
-        let until_expiry = response.expires_at.saturating_sub(now);
-        if until_expiry == 0 {
+        let expires_at = UNIX_EPOCH
+            .checked_add(Duration::from_secs(response.expires_at))
+            .ok_or_else(|| anyhow!("invalid Copilot token expiry"))?;
+        let until_expiry = expires_at
+            .duration_since(SystemTime::now())
+            .map_err(|_| anyhow!("Copilot returned an expired token"))?;
+        if until_expiry.is_zero() {
             bail!("Copilot returned an expired token");
         }
+        let now = Instant::now();
+        let expires_monotonic = now
+            .checked_add(until_expiry)
+            .ok_or_else(|| anyhow!("invalid Copilot token expiry"))?;
         // Refresh before expiration and never later than GitHub's refresh interval.
-        let lifetime = response
-            .refresh_in
-            .max(1)
-            .min(until_expiry.saturating_sub(30).max(1));
+        let lifetime = Duration::from_secs(response.refresh_in.max(1))
+            .min(until_expiry.saturating_sub(Duration::from_secs(30)));
         let credential = CopilotCredential {
             token: response.token,
             api_base,
         };
-        let refresh_at = Instant::now()
-            .checked_add(Duration::from_secs(lifetime))
+        let refresh_at = now
+            .checked_add(lifetime)
             .ok_or_else(|| anyhow!("invalid Copilot token expiry"))?;
-        *cache = Some(CachedCredential {
-            credential: credential.clone(),
+        Ok(CachedCredential {
+            credential,
             refresh_at,
-        });
-        Ok(credential)
+            expires_at,
+            expires_monotonic,
+        })
     }
 }
 
@@ -373,11 +451,17 @@ mod tests {
     use std::net::TcpListener;
 
     fn mock_server(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        mock_server_status(responses.into_iter().map(|body| (200, body)).collect())
+    }
+
+    fn mock_server_status(
+        responses: Vec<(u16, String)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for body in responses {
+            for (status, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -404,7 +488,7 @@ mod tests {
                     }
                 }
                 requests.push(String::from_utf8(input).unwrap());
-                write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                write!(stream, "HTTP/1.1 {status} mock\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).unwrap();
             }
             requests
         });
@@ -478,6 +562,143 @@ mod tests {
         let (base, server) = mock_server(vec![
             r#"{"token":"secret","refresh_in":10,"expires_at":1}"#.into(),
         ]);
+        let auth = CopilotAuth::new(test_auth(base), "secret".into()).unwrap();
+        assert!(auth.credential().await.is_err());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn refreshes_after_interval_and_uses_default_endpoint() {
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let (base, server) = mock_server(vec![
+            format!(r#"{{"token":"first","refresh_in":1,"expires_at":{expiry}}}"#),
+            format!(r#"{{"token":"second","refresh_in":600,"expires_at":{expiry}}}"#),
+        ]);
+        let auth = CopilotAuth::new(test_auth(base), "secret".into()).unwrap();
+        let first = auth.credential().await.unwrap();
+        assert_eq!(first.api_base, "https://api.githubcopilot.com");
+        assert_eq!(first.token, "first");
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        assert_eq!(auth.credential().await.unwrap().token, "second");
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn temporary_refresh_failure_uses_valid_cache_then_retries() {
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 300;
+        let (base, server) = mock_server_status(vec![
+            (
+                200,
+                format!(r#"{{"token":"first","refresh_in":600,"expires_at":{expiry}}}"#),
+            ),
+            (503, "down".into()),
+            (
+                200,
+                format!(r#"{{"token":"second","refresh_in":600,"expires_at":{expiry}}}"#),
+            ),
+        ]);
+        let auth = CopilotAuth::new(test_auth(base), "secret".into()).unwrap();
+        assert_eq!(auth.credential().await.unwrap().token, "first");
+        auth.cached.lock().await.as_mut().unwrap().refresh_at = Instant::now();
+        assert_eq!(auth.credential().await.unwrap().token, "first");
+        // The retry delay prevents every concurrent request hammering the endpoint.
+        assert_eq!(auth.credential().await.unwrap().token, "first");
+        auth.cached.lock().await.as_mut().unwrap().refresh_at = Instant::now();
+        assert_eq!(auth.credential().await.unwrap().token, "second");
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn expired_cache_and_nontransient_errors_never_fallback() {
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 300;
+        let body = format!(r#"{{"token":"first","refresh_in":600,"expires_at":{expiry}}}"#);
+        let (base, server) = mock_server_status(vec![(200, body.clone()), (503, "down".into())]);
+        let auth = CopilotAuth::new(test_auth(base), "secret".into()).unwrap();
+        auth.credential().await.unwrap();
+        {
+            let mut cache = auth.cached.lock().await;
+            let cached = cache.as_mut().unwrap();
+            // A forward wall-clock change must invalidate a token even before refresh_at.
+            cached.expires_at = SystemTime::now() - Duration::from_secs(1);
+        }
+        assert!(auth.credential().await.is_err());
+        server.join().unwrap();
+
+        let (base, server) = mock_server_status(vec![(200, body), (401, "denied".into())]);
+        let auth = CopilotAuth::new(test_auth(base), "secret".into()).unwrap();
+        auth.credential().await.unwrap();
+        auth.cached.lock().await.as_mut().unwrap().refresh_at = Instant::now();
+        let error = match auth.credential().await {
+            Ok(_) => panic!("expected authorization error"),
+            Err(e) => e,
+        };
+        assert!(error.to_string().contains("401"));
+        assert!(!error.to_string().contains("secret"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_failure_uses_valid_cache_but_not_expired_cache() {
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 300;
+        let (base, server) = mock_server(vec![format!(
+            r#"{{"token":"first","refresh_in":600,"expires_at":{expiry}}}"#
+        )]);
+        let auth = CopilotAuth::new(test_auth(base), "secret".into()).unwrap();
+        auth.credential().await.unwrap();
+        server.join().unwrap();
+        auth.cached.lock().await.as_mut().unwrap().refresh_at = Instant::now();
+        assert_eq!(auth.credential().await.unwrap().token, "first");
+        {
+            let mut cache = auth.cached.lock().await;
+            let cached = cache.as_mut().unwrap();
+            cached.expires_monotonic = Instant::now();
+        }
+        assert!(auth.credential().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn device_denial_and_expiry_are_errors() {
+        let (base, server) = mock_server(vec![r#"{"error":"access_denied"}"#.into()]);
+        let auth = test_auth(base);
+        let device = DeviceCode {
+            device_code: "private".into(),
+            user_code: "public".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            expires_in: 30,
+            interval: 1,
+        };
+        assert!(auth.poll_device_token(&device).await.is_err());
+        server.join().unwrap();
+        let expired = DeviceCode {
+            expires_in: 0,
+            ..device
+        };
+        assert!(auth.poll_device_token(&expired).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exchange_rejects_oversized_and_invalid_json() {
+        let (base, server) = mock_server(vec!["x".repeat(MAX_RESPONSE + 1)]);
+        let auth = CopilotAuth::new(test_auth(base), "secret".into()).unwrap();
+        assert!(auth.credential().await.is_err());
+        server.join().unwrap();
+        let (base, server) = mock_server(vec!["not json".into()]);
         let auth = CopilotAuth::new(test_auth(base), "secret".into()).unwrap();
         assert!(auth.credential().await.is_err());
         server.join().unwrap();
