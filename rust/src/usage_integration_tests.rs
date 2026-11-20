@@ -367,6 +367,12 @@ async fn rolling_rate_endpoint_requires_key_and_filters_sessions() {
     assert_eq!(data["session_id"], "one");
     assert_eq!(data["windows"][0]["totals"]["request_count"], 1);
     assert_eq!(data["windows"][0]["totals"]["total_tokens"], 10);
+    for (index, label, seconds) in [(3, "week", 604800), (4, "month", 2592000)] {
+        assert_eq!(data["windows"][index]["id"], label);
+        assert_eq!(data["windows"][index]["duration_seconds"], seconds);
+        assert_eq!(data["windows"][index]["totals"]["request_count"], 1);
+        assert_eq!(data["windows"][index]["totals"]["total_tokens"], 10);
+    }
     let global = app
         .oneshot(get_request("/token-usage/rates", Some("key")))
         .await
@@ -376,4 +382,6 @@ async fn rolling_rate_endpoint_requires_key_and_filters_sessions() {
     assert_eq!(data["session_id"], serde_json::Value::Null);
     assert_eq!(data["windows"][0]["totals"]["request_count"], 2);
     assert_eq!(data["windows"][0]["totals"]["total_tokens"], 30);
+    assert_eq!(data["windows"][3]["totals"]["request_count"], 2);
+    assert_eq!(data["windows"][4]["totals"]["total_tokens"], 30);
 }

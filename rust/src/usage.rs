@@ -278,8 +278,14 @@ impl UsageStore {
             "SELECT {} FROM rust_usage_events WHERE created_at_ms>=? AND created_at_ms<=? AND (? IS NULL OR session_id=?)",
             totals_sql()
         );
-        let mut windows = Vec::with_capacity(3);
-        for (id, seconds) in [("minute", 60_i64), ("hour", 3600_i64), ("day", 86400_i64)] {
+        let mut windows = Vec::with_capacity(5);
+        for (id, seconds) in [
+            ("minute", 60_i64),
+            ("hour", 3_600),
+            ("day", 86_400),
+            ("week", 7 * 86_400),
+            ("month", 30 * 86_400),
+        ] {
             let start_ms = as_of_ms.saturating_sub(seconds * 1000);
             let totals = tx.query_row(
                 &sql,
@@ -598,6 +604,49 @@ mod tests {
     }
 
     #[test]
+    fn rolling_week_and_month_are_bounded_and_session_filtered() -> Result<()> {
+        let store = UsageStore::in_memory()?;
+        let now = 1_800_000_000_000_i64;
+        let day_ms = 86_400_000_i64;
+        for (elapsed_ms, session, amount, aiu) in [
+            (7 * day_ms, "one", 10, Some(100)),
+            (7 * day_ms + 1, "two", 20, None),
+            (30 * day_ms, "two", 30, None),
+            (30 * day_ms + 1, "one", 40, Some(100)),
+            (-1, "one", 50, Some(100)),
+        ] {
+            let mut item = event("m", session, amount);
+            item.created_at_ms = now - elapsed_ms;
+            item.total_nano_aiu = aiu;
+            store.record(item)?;
+        }
+
+        let all = store.rates_at(None, now)?;
+        let week = &all["windows"][3];
+        assert_eq!(week["id"], "week");
+        assert_eq!(week["duration_seconds"], 7 * 86_400);
+        assert_eq!(week["totals"]["request_count"], 1);
+        assert_eq!(week["totals"]["total_tokens"], 12);
+        assert_eq!(week["totals"]["costs"][0]["total_cost_nanos"], 1);
+        let month = &all["windows"][4];
+        assert_eq!(month["id"], "month");
+        assert_eq!(month["duration_seconds"], 30 * 86_400);
+        assert_eq!(month["totals"]["request_count"], 3);
+        assert_eq!(month["totals"]["total_tokens"], 66);
+        assert_eq!(month["totals"]["costs"][0]["total_cost_nanos"], 1);
+
+        let one = store.rates_at(Some("one"), now)?;
+        assert_eq!(one["windows"][3]["totals"]["request_count"], 1);
+        assert_eq!(one["windows"][4]["totals"]["request_count"], 1);
+        let two = store.rates_at(Some("two"), now)?;
+        assert_eq!(two["windows"][3]["totals"]["request_count"], 0);
+        assert_eq!(two["windows"][4]["totals"]["request_count"], 2);
+        assert_eq!(two["windows"][4]["totals"]["total_tokens"], 54);
+        assert_eq!(two["windows"][4]["totals"]["costs"], json!([]));
+        Ok(())
+    }
+
+    #[test]
     fn rolling_rates_persist_and_reopen() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("copilot-rust-rates-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir)?;
@@ -609,9 +658,11 @@ mod tests {
         {
             let store = UsageStore::open(&path)?;
             let rate = store.rates(Some("session"))?;
-            assert_eq!(rate["windows"][0]["totals"]["request_count"], 1);
-            assert_eq!(rate["windows"][0]["totals"]["total_tokens"], 14);
-            assert_eq!(rate["windows"][0]["totals"]["costs"], json!([]));
+            for window in rate["windows"].as_array().unwrap() {
+                assert_eq!(window["totals"]["request_count"], 1);
+                assert_eq!(window["totals"]["total_tokens"], 14);
+                assert_eq!(window["totals"]["costs"], json!([]));
+            }
         }
         std::fs::remove_dir_all(dir)?;
         Ok(())

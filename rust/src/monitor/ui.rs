@@ -235,7 +235,13 @@ fn rate_lines(rates: Option<&Value>, width: usize, exact: bool) -> Vec<String> {
         return vec!["Rolling reported counts: unavailable".into()];
     };
     let mut lines = Vec::new();
-    for (id, default_label) in [("minute", "1m"), ("hour", "1h"), ("day", "24h")] {
+    for (id, default_label) in [
+        ("minute", "1m"),
+        ("hour", "1h"),
+        ("day", "24h"),
+        ("week", "7d"),
+        ("month", "30d"),
+    ] {
         let Some(window) = windows
             .iter()
             .find(|w| w.get("id").and_then(Value::as_str) == Some(id))
@@ -247,6 +253,8 @@ fn rate_lines(rates: Option<&Value>, width: usize, exact: bool) -> Vec<String> {
             Some(60) => "1m".to_owned(),
             Some(3600) => "1h".to_owned(),
             Some(86400) => "24h".to_owned(),
+            Some(604800) => "7d".to_owned(),
+            Some(2592000) => "30d".to_owned(),
             Some(n) => format!("{n}s"),
             None => default_label.into(),
         };
@@ -419,7 +427,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             < 5u16
                 .saturating_add(3)
                 .saturating_add(rate_height)
-                .saturating_add(3)
+                .saturating_add(2)
     {
         frame.render_widget(
             Paragraph::new("Resize taller or wider to show overview and all rolling windows.")
@@ -472,7 +480,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     let body = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(rate_height),
-        Constraint::Min(3),
+        Constraint::Min(2),
     ])
     .split(parts[1]);
     let detail = format!(
@@ -1629,7 +1637,71 @@ mod tests {
             assert!(display.contains("1m: 11 req / 111 tok"), "{display}");
             assert!(display.contains("1h: 22 req / 222 tok"), "{display}");
             assert!(display.contains("24h: —"), "{display}");
+            assert!(display.contains("7d: —"), "{display}");
+            assert!(display.contains("30d: —"), "{display}");
         }
+    }
+
+    #[test]
+    fn rolling_week_and_month_are_visible_globally_and_per_session() {
+        let null = Value::Null;
+        let windows = json!([
+            {"id":"minute","duration_seconds":60,"totals":{"request_count":1,"total_tokens":10,"costs":[{"currency":"USD","amount":0.01}]}},
+            {"id":"hour","duration_seconds":3600,"totals":{"request_count":2,"total_tokens":20,"costs":[{"currency":"USD","amount":0.02}]}},
+            {"id":"day","duration_seconds":86400,"totals":{"request_count":3,"total_tokens":30,"costs":[{"currency":"USD","amount":0.03}]}},
+            {"id":"week","duration_seconds":604800,"totals":{"request_count":4,"total_tokens":40,"costs":[{"currency":"USD","amount":0.04}]}},
+            {"id":"month","duration_seconds":2592000,"totals":{"request_count":5,"total_tokens":50,"costs":[{"currency":"USD","amount":0.05}]}}
+        ]);
+        let rates = json!({"windows": windows});
+        let session_rates = json!({"session_id":"selected","windows":rates["windows"]});
+        let sessions_data = json!({"items":[{"session_id":"selected","request_count":5,"input_tokens":20,"output_tokens":30,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"total_tokens":50,"costs":[]}],"total_pages":1});
+        let mut v = view(&null, &null, &null, &null);
+        v.rates = Some(&rates);
+        v.sessions = Some(&sessions_data);
+        v.session_rates = Some(&session_rates);
+        for (width, height) in [(178, 46), (80, 24), (42, 24)] {
+            for tab in [0, 4] {
+                v.tab = tab;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| render(f, &v)).unwrap();
+                let display = render_text(&terminal);
+                for expected in [
+                    "1m: 1 req / 10 tok",
+                    "1h: 2 req / 20 tok",
+                    "24h: 3 req / 30 tok",
+                    "7d: 4 req / 40 tok",
+                    "30d: 5 req / 50 tok",
+                    "USD 0.0400",
+                    "USD 0.0500",
+                ] {
+                    assert!(
+                        display.contains(expected),
+                        "missing {expected} in tab {tab} at {width}x{height}: {display}"
+                    );
+                }
+            }
+        }
+        // Very small screens must explicitly request a resize rather than truncate.
+        for tab in [0, 4] {
+            v.tab = tab;
+            let mut terminal = Terminal::new(TestBackend::new(42, 12)).unwrap();
+            terminal.draw(|f| render(f, &v)).unwrap();
+            assert!(render_text(&terminal).contains("Resize"));
+        }
+    }
+
+    #[test]
+    fn rolling_week_and_month_respect_count_units_and_missing_values() {
+        let rates = json!({"windows":[
+            {"id":"week","duration_seconds":604800,"totals":{"request_count":1200,"total_tokens":1234567}},
+            {"id":"month","duration_seconds":2592000,"totals":{"request_count":null}}
+        ]});
+        let compact = rate_lines(Some(&rates), 100, false).join("\n");
+        assert!(compact.contains("7d: 1.2K req / ~1.23M tok"), "{compact}");
+        assert!(compact.contains("30d: — req / — tok"), "{compact}");
+        let exact = rate_lines(Some(&rates), 100, true).join("\n");
+        assert!(exact.contains("7d: 1,200 req / 1,234,567 tok"), "{exact}");
+        assert!(exact.contains("30d: — req / — tok"), "{exact}");
     }
 
     #[test]
