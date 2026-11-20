@@ -29,6 +29,11 @@ impl QuotaClient {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_url(github_token: String, url: &str) -> Result<Self> {
+        Self::with_url(github_token, Url::parse(url)?)
+    }
+
     fn with_url(github_token: String, url: Url) -> Result<Self> {
         if github_token.trim().is_empty() {
             bail!("empty GitHub token");

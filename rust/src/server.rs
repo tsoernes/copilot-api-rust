@@ -655,6 +655,72 @@ mod tests {
     use super::*;
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn quota_routes_require_auth_and_use_github_token() {
+        use axum::{body::to_bytes, routing::get};
+        let upstream = Router::new().route("/quota", get(|headers: HeaderMap| async move {
+            assert_eq!(headers[header::AUTHORIZATION], "token secret-github-token");
+            axum::Json(json!({"copilot_plan":"individual","quota_snapshots":{"chat":{"entitlement":100,"remaining":75}}}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let github = crate::auth::GitHubAuth::new(crate::auth::AuthConfig::default()).unwrap();
+        let auth = Arc::new(CopilotAuth::new(github, "unused".into()).unwrap());
+        let mut state = new_state(auth, Some("client-key".into())).unwrap();
+        state.quota = Some(Arc::new(
+            QuotaClient::with_test_url(
+                "secret-github-token".into(),
+                &format!("http://{address}/quota"),
+            )
+            .unwrap(),
+        ));
+        let app = build_router(state);
+        let request = |path: &str, key: Option<&str>| {
+            let mut r = Request::builder()
+                .uri(path)
+                .header(header::HOST, "localhost");
+            if let Some(key) = key {
+                r = r.header(header::AUTHORIZATION, format!("Bearer {key}"));
+            }
+            r.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/usage", None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let raw = app
+            .clone()
+            .oneshot(request("/usage", Some("client-key")))
+            .await
+            .unwrap();
+        assert_eq!(raw.status(), StatusCode::OK);
+        let raw: Value =
+            serde_json::from_slice(&to_bytes(raw.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(raw["copilot_plan"], "individual");
+        let normalized = app
+            .clone()
+            .oneshot(request("/usage/github-copilot", Some("client-key")))
+            .await
+            .unwrap();
+        assert_eq!(normalized.headers()[header::CACHE_CONTROL], "no-store");
+        let normalized: Value =
+            serde_json::from_slice(&to_bytes(normalized.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(normalized["windows"][0]["usedPercent"], 25.0);
+        assert_eq!(
+            app.oneshot(request("/usage/other", Some("client-key")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        server.abort();
+    }
+
     #[test]
     fn client_key_checks_bearer_and_anthropic_header() {
         let mut h = HeaderMap::new();
