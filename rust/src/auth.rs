@@ -201,24 +201,29 @@ impl GitHubAuth {
             if let Ok(response) = response
                 && response.status().is_success()
             {
-                let result: PollResponse = tokio::time::timeout_at(
+                let result = tokio::time::timeout_at(
                     deadline.into(),
-                    parse_json(response, "GitHub device authorization"),
+                    parse_json::<PollResponse>(response, "GitHub device authorization"),
                 )
                 .await
-                .map_err(|_| anyhow!("GitHub device authorization expired; sign in again"))??;
-                if let Some(token) = result.access_token.filter(|s| !s.is_empty()) {
-                    return Ok(token);
-                }
-                match result.error.as_deref() {
-                    Some("slow_down") => {
-                        interval = interval.saturating_add(5).max(result.interval.unwrap_or(0))
+                .map_err(|_| anyhow!("GitHub device authorization expired; sign in again"))?;
+                // A truncated or malformed response can be a transient transport
+                // failure. Like upstream, retry it until the device code expires;
+                // an explicit OAuth denial remains a terminal error.
+                if let Ok(result) = result {
+                    if let Some(token) = result.access_token.filter(|s| !s.is_empty()) {
+                        return Ok(token);
                     }
-                    Some("authorization_pending") | None => {}
-                    Some(error) => bail!(
-                        "GitHub device authorization failed: {}",
-                        result.error_description.as_deref().unwrap_or(error)
-                    ),
+                    match result.error.as_deref() {
+                        Some("slow_down") => {
+                            interval = interval.saturating_add(5).max(result.interval.unwrap_or(0))
+                        }
+                        Some("authorization_pending") | None => {}
+                        Some(error) => bail!(
+                            "GitHub device authorization failed: {}",
+                            result.error_description.as_deref().unwrap_or(error)
+                        ),
+                    }
                 }
             }
             let delay = Duration::from_secs(interval.saturating_add(1));
@@ -690,6 +695,44 @@ mod tests {
             ..device
         };
         assert!(auth.poll_device_token(&expired).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn device_poll_retries_invalid_json_and_server_errors() {
+        let (base, server) = mock_server_status(vec![
+            (200, "truncated-json".into()),
+            (503, "temporary failure".into()),
+            (200, r#"{"access_token":"private-token"}"#.into()),
+        ]);
+        let auth = test_auth(base);
+        let device = DeviceCode {
+            device_code: "private".into(),
+            user_code: "public".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            expires_in: 15,
+            interval: 1,
+        };
+        assert_eq!(
+            auth.poll_device_token(&device).await.unwrap(),
+            "private-token"
+        );
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn device_poll_slow_down_never_extends_device_lifetime() {
+        let (base, server) = mock_server(vec![r#"{"error":"slow_down","interval":20}"#.into()]);
+        let auth = test_auth(base);
+        let device = DeviceCode {
+            device_code: "private".into(),
+            user_code: "public".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            expires_in: 1,
+            interval: 1,
+        };
+        let error = auth.poll_device_token(&device).await.err().unwrap();
+        assert!(error.to_string().contains("expired"));
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[tokio::test]
