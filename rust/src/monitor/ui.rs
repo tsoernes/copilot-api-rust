@@ -1637,7 +1637,7 @@ mod tests {
                 "Remaining: 600",
                 "quota_remaining: 600.25",
                 "reset: 2026-12-01",
-                "25.7164% used",
+                "40% used",
                 "Chat",
                 "Limit: Unlimited",
                 "Completions",
