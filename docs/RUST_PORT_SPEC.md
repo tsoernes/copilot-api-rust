@@ -10,6 +10,7 @@
 - Refresh GitHub quota every 60 seconds and on manual refresh, while local statistics refresh every five seconds. (User, 2026-11-20.)
 - Stop the server started by the dashboard when the dashboard is quit. (User, 2026-11-20.)
 - The terminal request display should provide the most fine-grained token breakdown possible, rather than only a single total. The user reports that many requests appear incorrectly as cancelled; investigate and correct the classification. (User, 2026-11-20.)
+- The terminal monitor should show session statistics and request, token and cost counters per minute, hour and day, globally and per session. Global usage should persist across sessions and server restarts. (User, 2026-11-20.)
 
 ## Implementation notes (not user requirements)
 
