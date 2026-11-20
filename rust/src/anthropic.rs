@@ -143,7 +143,13 @@ pub fn request_to_chat(payload: Value) -> Result<Value, String> {
                 for block in blocks {
                     match string(block,"type")? {
                         "tool_use" => calls.push(json!({"id":string(block,"id")?,"type":"function","function":{"name":string(block,"name")?,"arguments":serde_json::to_string(block.get("input").ok_or("tool use missing input")?).map_err(|e| e.to_string())?}})),
-                        "thinking" => { let text = string(block,"thinking")?; if !text.is_empty() { thought.push(text.to_owned()); } if let Some(s) = block.get("signature").and_then(Value::as_str) { if !s.is_empty() { signature = Some(s.to_owned()); } } },
+                        "thinking" => {
+                            let text = string(block, "thinking")?;
+                            if !text.is_empty() { thought.push(text.to_owned()); }
+                            if let Some(s) = block.get("signature").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                                signature = Some(s.to_owned());
+                            }
+                        },
                         _ => ordinary.push(block.clone()),
                     }
                 }
@@ -208,22 +214,22 @@ pub fn request_to_chat(payload: Value) -> Result<Value, String> {
             }
             converted.push(json!({"type":"function","function":function}));
         }
-        if !converted.is_empty() {
-            if let Some(choice) = payload.get("tool_choice") {
-                let c = match string(choice, "type")? {
-                    "auto" => json!("auto"),
-                    "any" => json!("required"),
-                    "none" => json!("none"),
-                    "tool" => json!({"type":"function","function":{"name":string(choice,"name")?}}),
-                    other => return Err(format!("unsupported tool choice {other}")),
-                };
-                out.insert("tool_choice".into(), c);
-                if let Some(v) = choice.get("disable_parallel_tool_use") {
-                    out.insert(
-                        "parallel_tool_calls".into(),
-                        json!(!v.as_bool().ok_or("invalid disable_parallel_tool_use")?),
-                    );
-                }
+        if !converted.is_empty()
+            && let Some(choice) = payload.get("tool_choice")
+        {
+            let c = match string(choice, "type")? {
+                "auto" => json!("auto"),
+                "any" => json!("required"),
+                "none" => json!("none"),
+                "tool" => json!({"type":"function","function":{"name":string(choice,"name")?}}),
+                other => return Err(format!("unsupported tool choice {other}")),
+            };
+            out.insert("tool_choice".into(), c);
+            if let Some(v) = choice.get("disable_parallel_tool_use") {
+                out.insert(
+                    "parallel_tool_calls".into(),
+                    json!(!v.as_bool().ok_or("invalid disable_parallel_tool_use")?),
+                );
             }
         }
         out.insert("tools".into(), json!(converted));
@@ -311,10 +317,10 @@ pub fn response_from_chat(response: Value) -> Result<Value, String> {
                 blocks.push(json!({"type":"tool_use","id":string(call,"id")?,"name":string(f,"name")?,"input":input}));
             }
         }
-        if let Some(r) = choice.get("finish_reason").and_then(Value::as_str) {
-            if stop.is_null() || r == "tool_calls" {
-                stop = json!(stop_reason(r)?);
-            }
+        if let Some(r) = choice.get("finish_reason").and_then(Value::as_str)
+            && (stop.is_null() || r == "tool_calls")
+        {
+            stop = json!(stop_reason(r)?);
         }
     }
     Ok(
