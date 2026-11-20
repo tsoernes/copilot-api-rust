@@ -14,6 +14,11 @@
 - Reduce unnecessary large-request copies while preserving request behavior and the 16 MiB request limit. (User, 2026-11-20.)
 - The quota view should show used, allowance and remaining credit amounts, not only percentages. Make changing “Usage billed to” between personal and organization accounts and between organizations possible if supported. (User, 2026-11-20.)
 - If supported, provide optional automatic billing-account switching when a stream reports monthly quota exhaustion. It must be off by default, restricted to a user-selected ordered allowlist, and automatically retry the failed request once after switching. (User, 2026-11-20.)
+- Display token and other count quantities using thousands/millions-style units (K, M, etc.). (User, 2026-11-20.)
+
+## Open questions
+
+- Should compact counts be the default with an exact-count toggle, always remain exact with suffixes, or be compact only? (Asked 2026-11-20.)
 
 ## Implementation notes (not user requirements)
 
