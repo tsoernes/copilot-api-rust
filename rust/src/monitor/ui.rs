@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Sparkline, Table, Tabs, Wrap},
 };
 use serde_json::Value;
 
@@ -16,11 +16,19 @@ pub struct View<'a> {
     pub summary: Option<&'a Value>,
     pub daily: Option<&'a Value>,
     pub events: Option<&'a Value>,
+    pub sessions: Option<&'a Value>,
+    pub rates: Option<&'a Value>,
+    pub session_rates: Option<&'a Value>,
     pub quota: Option<&'a Value>,
     pub status: &'a str,
     pub page: usize,
     pub model_offset: usize,
     pub event_offset: usize,
+    pub session_page: usize,
+    pub session_offset: usize,
+    pub show_event_detail: bool,
+    pub detail_scroll: usize,
+    pub confirm_billing: bool,
     pub paused: bool,
     pub last_updated: &'a str,
     pub error: Option<&'a str>,
@@ -112,6 +120,119 @@ fn cost(value: &Value) -> String {
     }
 }
 
+fn decimal(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| {
+            // Avoid hundreds of digits for abnormal finite floating values.
+            if n >= 1.0e12 {
+                format!("{n:.2e}")
+            } else {
+                format!("{n:.2}")
+            }
+        })
+        .unwrap_or_else(|| "—".into())
+}
+
+fn quota_quantity(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return "—".into();
+    };
+    if value.as_i64().is_some() {
+        return number(Some(value));
+    }
+    if let Some(integer) = value.as_u64() {
+        return integer.to_string();
+    }
+    value
+        .as_f64()
+        .filter(|n| n.is_finite())
+        .map(|n| {
+            let raw = if n.fract() == 0.0 && n.abs() < 1.0e15 {
+                format!("{n:.0}")
+            } else {
+                n.to_string()
+            };
+            if let Some((whole, fraction)) = raw.split_once('.')
+                && let Ok(integer) = whole.parse::<i64>()
+            {
+                if whole == "-0" {
+                    format!("-0.{fraction}")
+                } else {
+                    format!("{}.{}", number(Some(&Value::from(integer))), fraction)
+                }
+            } else if let Ok(integer) = raw.parse::<i64>() {
+                number(Some(&Value::from(integer)))
+            } else {
+                raw
+            }
+        })
+        .unwrap_or_else(|| "—".into())
+}
+
+/// Rolling windows are reported event counts, not all HTTP requests or an
+/// extrapolated rate. Preserve missing fields as unavailable.
+fn rate_lines(rates: Option<&Value>, width: usize) -> Vec<String> {
+    let Some(windows) = rates
+        .and_then(|v| v.get("windows"))
+        .and_then(Value::as_array)
+    else {
+        return vec!["Rolling reported counts: unavailable".into()];
+    };
+    let mut lines = Vec::new();
+    for (id, default_label) in [("minute", "1m"), ("hour", "1h"), ("day", "24h")] {
+        let Some(window) = windows
+            .iter()
+            .find(|w| w.get("id").and_then(Value::as_str) == Some(id))
+        else {
+            lines.push(format!("{default_label}: —"));
+            continue;
+        };
+        let label = match window.get("duration_seconds").and_then(Value::as_u64) {
+            Some(60) => "1m".to_owned(),
+            Some(3600) => "1h".to_owned(),
+            Some(86400) => "24h".to_owned(),
+            Some(n) => format!("{n}s"),
+            None => default_label.into(),
+        };
+        let totals = window.get("totals").unwrap_or(&Value::Null);
+        let requests = number(totals.get("request_count"));
+        let tokens = number(totals.get("total_tokens"));
+        let estimated = cost(totals);
+        let combined = format!("{label}: {requests} req / {tokens} tok · est {estimated}");
+        if combined.chars().count() <= width {
+            lines.push(combined);
+        } else {
+            lines.push(format!("{label} requests: {requests}"));
+            lines.push(format!("  tokens: {tokens}"));
+            lines.push(format!("  est: {estimated}"));
+        }
+    }
+    lines
+}
+
+fn wrap_physical_lines(lines: Vec<String>, width: usize) -> Vec<String> {
+    let mut wrapped = Vec::new();
+    for line in lines {
+        // Generated punctuation is single-width. For unusual external Unicode
+        // text, use a conservative half width to accommodate wide glyphs.
+        let chunk = if line.chars().all(|c| c.is_ascii() || matches!(c, '—' | '·')) {
+            width.max(1)
+        } else {
+            (width / 2).max(1)
+        };
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            wrapped.push(String::new());
+        }
+        for part in chars.chunks(chunk) {
+            wrapped.push(part.iter().collect());
+        }
+    }
+    wrapped
+}
+
 fn panel(title: &str) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
@@ -159,9 +280,14 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         clean(view.last_updated)
     )));
     frame.render_widget(Paragraph::new(header), parts[0]);
-    let tab = view.tab.min(3);
+    let tab = view.tab.min(4);
+    let labels = if area.width < 48 {
+        ["1:O", "2:Q", "3:M", "4:R", "5:S"]
+    } else {
+        ["Overview", "Quota", "Models", "Requests", "Sessions"]
+    };
     frame.render_widget(
-        Tabs::new(["Overview", "Quota", "Models", "Requests"])
+        Tabs::new(labels)
             .block(panel("Views"))
             .select(tab)
             .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
@@ -172,25 +298,29 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         0 => overview(frame, parts[2], view),
         1 => quota(frame, parts[2], view),
         2 => models(frame, parts[2], view),
-        _ => events(frame, parts[2], view),
+        3 => events(frame, parts[2], view),
+        _ => sessions(frame, parts[2], view),
     }
+    let controls = if view.tab == 1 {
+        " 1–5/Tab views  p period  r refresh  space pause  b billing settings  q quit"
+    } else if view.tab == 3 && view.show_event_detail {
+        " ↑/↓ detail  d return  ←/→ page  p period  r refresh  q quit"
+    } else if view.tab == 3 {
+        " 1–5/Tab views  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  d detail  q quit"
+    } else {
+        " 1–5/Tab views  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit"
+    };
     let footer = if let Some(error) = view.error {
         vec![
             Line::styled(
                 format!(" {}", clean(error)),
                 Style::default().fg(Color::Red),
             ),
-            Line::styled(
-                " 1–4/Tab views  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit",
-                Style::default().fg(MUTED),
-            ),
+            Line::styled(controls, Style::default().fg(MUTED)),
         ]
     } else {
         vec![
-            Line::styled(
-                " 1–4/Tab views  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit",
-                Style::default().fg(MUTED),
-            ),
+            Line::styled(controls, Style::default().fg(MUTED)),
             Line::styled(
                 " Usage is upstream-reported; cost is estimated, not a bill.",
                 Style::default().fg(MUTED),
@@ -198,17 +328,48 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         ]
     };
     frame.render_widget(Paragraph::new(footer), parts[3]);
+    if view.confirm_billing {
+        let width = area.width.min(82);
+        let height = area.height.min(12);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new("Open GitHub Copilot billing settings?\ny open / n cancel\nSelection changes are made by you in GitHub; this gateway does not switch automatically.\nhttps://github.com/settings/copilot/features")
+                .block(panel("Confirm browser action"))
+                .wrap(Wrap { trim: false }),
+            popup,
+        );
+    }
 }
 
 fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
-    let Some(summary) = view.summary else {
+    let totals = view
+        .summary
+        .and_then(|s| s.get("totals"))
+        .unwrap_or(&Value::Null);
+    let width = usize::from(area.width.saturating_sub(2));
+    let rolling = wrap_physical_lines(rate_lines(view.rates, width), width);
+    let rate_height = u16::try_from(rolling.len().saturating_add(2)).unwrap_or(u16::MAX);
+    if view.rates.is_some()
+        && area.height
+            < 5u16
+                .saturating_add(3)
+                .saturating_add(rate_height)
+                .saturating_add(3)
+    {
         frame.render_widget(
-            Paragraph::new("Waiting for usage data…").block(panel("Overview")),
+            Paragraph::new("Resize taller or wider to show overview and all rolling windows.")
+                .block(panel("Overview"))
+                .wrap(Wrap { trim: true }),
             area,
         );
         return;
-    };
-    let totals = summary.get("totals").unwrap_or(&Value::Null);
+    }
     let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(3)]).split(area);
     let cards = Layout::horizontal([
         Constraint::Percentage(25),
@@ -249,7 +410,12 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             rect,
         );
     }
-    let body = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(parts[1]);
+    let body = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(rate_height),
+        Constraint::Min(3),
+    ])
+    .split(parts[1]);
     let detail = format!(
         " Cache read: {}    Cache write: {}    Nano-AIU: {}",
         number(totals.get("cache_read_input_tokens")),
@@ -259,6 +425,11 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     frame.render_widget(
         Paragraph::new(detail).block(panel("Cache & Copilot")),
         body[0],
+    );
+    frame.render_widget(
+        Paragraph::new(rolling.into_iter().map(Line::from).collect::<Vec<_>>())
+            .block(panel("Rolling reported counts · costs estimated")),
+        body[1],
     );
     let values: Vec<u64> = view
         .daily
@@ -276,7 +447,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     if values.is_empty() {
         frame.render_widget(
             Paragraph::new("No daily usage reported yet.").block(panel("Daily tokens")),
-            body[1],
+            body[2],
         );
     } else {
         frame.render_widget(
@@ -284,7 +455,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
                 .data(&values)
                 .style(Style::default().fg(ACCENT))
                 .block(panel("Daily tokens · oldest → newest")),
-            body[1],
+            body[2],
         );
     }
 }
@@ -313,17 +484,14 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     let block = panel("Copilot quota · GitHub reported");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let rows = Layout::vertical(
-        windows
-            .iter()
-            .map(|_| Constraint::Length(3))
-            .collect::<Vec<_>>(),
-    )
-    .split(inner);
-    for (window, rect) in windows.iter().zip(rows.iter()) {
-        if rect.height == 0 {
-            continue;
-        }
+    let width = usize::from(inner.width);
+    let token_based = view
+        .quota
+        .and_then(|quota| quota.get("tokenBasedBilling"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let mut groups = Vec::new();
+    for window in windows {
         let unlimited = window
             .get("unlimited")
             .and_then(Value::as_bool)
@@ -332,25 +500,96 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             .get("usedPercent")
             .and_then(Value::as_f64)
             .filter(|v| v.is_finite());
-        let label = if unlimited {
-            "Unlimited".to_owned()
-        } else if let Some(used) = used {
-            format!("{:.1}% used", used)
-        } else {
-            "Usage unavailable".into()
-        };
         let name = text(window, "name");
         let reset = window
             .get("resetDate")
             .and_then(Value::as_str)
             .map(clean)
-            .map(|d| format!("  reset {d}"))
-            .unwrap_or_default();
-        let title = format!("{name} · {label}{reset}");
-        if unlimited || used.is_none() {
-            frame.render_widget(Paragraph::new(title), *rect);
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                window
+                    .get("resetAt")
+                    .and_then(Value::as_i64)
+                    .and_then(|seconds| Local.timestamp_opt(seconds, 0).single())
+                    .map(|date| date.format("%Y-%m-%d %H:%M").to_string())
+            })
+            .unwrap_or_else(|| "—".into());
+        // The upstream compatibility projection calls these "requests" even
+        // for token-based billing. Avoid asserting unverified unit semantics.
+        let unit = if token_based {
+            "units".to_owned()
         } else {
-            let used = used.unwrap_or(0.0).clamp(0.0, 100.0);
+            window
+                .get("unit")
+                .and_then(Value::as_str)
+                .map(clean)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "unit not reported".into())
+        };
+        let limit = if unlimited && window.get("limit").is_none_or(Value::is_null) {
+            "Unlimited".to_owned()
+        } else {
+            quota_quantity(window.get("limit"))
+        };
+        let remaining = quota_quantity(window.get("remaining"));
+        let reported_quota = quota_quantity(window.get("reportedQuotaRemaining"));
+        let mut lines = vec![
+            format!("{name} · {unit} · reset: {reset}"),
+            format!(
+                "Used (derived): {} / Limit: {limit}",
+                quota_quantity(window.get("used"))
+            ),
+            format!("Remaining: {remaining}"),
+        ];
+        if reported_quota != "—" && reported_quota != remaining {
+            lines.push(format!("quota_remaining: {reported_quota}"));
+        }
+        let lines = wrap_physical_lines(lines, width);
+        groups.push((lines, unlimited, used));
+    }
+    let required = groups
+        .iter()
+        .map(|(lines, _, _)| lines.len().saturating_add(1))
+        .sum::<usize>()
+        + usize::from(token_based);
+    if required > usize::from(inner.height) {
+        frame.render_widget(
+            Paragraph::new("Resize taller or wider to show all quota counts and reset times.")
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    let mut constraints: Vec<_> = groups
+        .iter()
+        .flat_map(|(lines, _, _)| {
+            [
+                Constraint::Length(u16::try_from(lines.len()).unwrap_or(u16::MAX)),
+                Constraint::Length(1),
+            ]
+        })
+        .collect();
+    if token_based {
+        constraints.insert(0, Constraint::Length(1));
+    }
+    let areas = Layout::vertical(constraints).split(inner);
+    if token_based {
+        frame.render_widget(
+            Paragraph::new("Token-based billing; unit unconfirmed."),
+            areas[0],
+        );
+    }
+    let start = usize::from(token_based);
+    for (index, (lines, unlimited, used)) in groups.into_iter().enumerate() {
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()),
+            areas[start + index * 2],
+        );
+        let gauge_area = areas[start + index * 2 + 1];
+        if unlimited {
+            frame.render_widget(Paragraph::new("Unlimited"), gauge_area);
+        } else if let Some(used) = used {
+            let clamped = used.clamp(0.0, 100.0);
             let color = if used >= 90.0 {
                 Color::Red
             } else if used >= 75.0 {
@@ -360,12 +599,13 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             };
             frame.render_widget(
                 Gauge::default()
-                    .block(Block::default().title(title))
                     .gauge_style(Style::default().fg(color))
-                    .ratio(used / 100.0)
-                    .label(label),
-                *rect,
+                    .ratio(clamped / 100.0)
+                    .label(format!("{used}% used")),
+                gauge_area,
             );
+        } else {
+            frame.render_widget(Paragraph::new("Percentage: —"), gauge_area);
         }
     }
 }
@@ -389,8 +629,52 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         );
         return;
     }
-    let visible = usize::from(area.height.saturating_sub(3));
     let offset = view.model_offset.min(rows.len().saturating_sub(1));
+    let columns = [
+        ("Requests", "request_count"),
+        ("Input", "input_tokens"),
+        ("Output", "output_tokens"),
+        ("Cache read", "cache_read_input_tokens"),
+        ("Cache write", "cache_creation_input_tokens"),
+        ("Total", "total_tokens"),
+    ];
+    let widths: Vec<usize> = columns
+        .iter()
+        .map(|(label, key)| {
+            rows.iter()
+                .map(|m| number(m.get(*key)).len())
+                .max()
+                .unwrap_or(0)
+                .max(label.len())
+        })
+        .collect();
+    let cost_width = rows
+        .iter()
+        .map(cost)
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("Est. cost".len());
+    let ttft_width = rows
+        .iter()
+        .map(|m| decimal(m.get("average_first_token_ms")).len())
+        .max()
+        .unwrap_or(0)
+        .max("Avg TTFT ms".len());
+    let speed_width = rows
+        .iter()
+        .map(|m| decimal(m.get("output_tokens_per_second")).len())
+        .max()
+        .unwrap_or(0)
+        .max("Output tok/s".len());
+    let required =
+        12usize + widths.iter().sum::<usize>() + cost_width + ttft_width + speed_width + 9 + 2;
+    let wide = usize::from(area.width) >= required;
+    let visible = if wide {
+        usize::from(area.height.saturating_sub(3))
+    } else {
+        1
+    };
     let shown = visible.min(rows.len().saturating_sub(offset));
     let title = if shown == 0 {
         "Model breakdown".into()
@@ -402,34 +686,348 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             rows.len()
         )
     };
-    let items = rows.iter().skip(offset).take(visible).map(|m| {
-        Row::new(vec![
-            Cell::from(text(m, "model")),
-            Cell::from(number(m.get("request_count"))),
-            Cell::from(number(m.get("input_tokens"))),
-            Cell::from(number(m.get("output_tokens"))),
-            Cell::from(number(m.get("cache_read_input_tokens"))),
-            Cell::from(cost(m)),
-        ])
-    });
-    let table = Table::new(
-        items,
-        [
-            Constraint::Percentage(28),
-            Constraint::Percentage(10),
-            Constraint::Percentage(14),
-            Constraint::Percentage(14),
-            Constraint::Percentage(14),
-            Constraint::Percentage(20),
-        ],
-    )
-    .header(
-        Row::new(["Model", "Req", "Input", "Output", "Cache", "Est. cost"])
+    if !wide {
+        let model = &rows[offset];
+        let mut lines = vec![format!("Model: {}", text(model, "model"))];
+        lines.extend(
+            columns
+                .iter()
+                .map(|(label, key)| format!("{label}: {}", number(model.get(*key)))),
+        );
+        lines.push(format!("Estimated cost: {}", cost(model)));
+        lines.push(format!(
+            "Avg TTFT ms: {}",
+            decimal(model.get("average_first_token_ms"))
+        ));
+        lines.push(format!(
+            "Output tok/s: {}",
+            decimal(model.get("output_tokens_per_second"))
+        ));
+        let lines = wrap_physical_lines(lines, usize::from(area.width.saturating_sub(2)));
+        if lines.len() > usize::from(area.height.saturating_sub(2)) {
+            frame.render_widget(
+                Paragraph::new("Resize taller or wider to show all model statistics.")
+                    .block(panel(&title))
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                    .block(panel(&title)),
+                area,
+            );
+        }
+        return;
+    }
+    let items = rows
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .enumerate()
+        .map(|(index, m)| {
+            let mut cells = vec![Cell::from(if index == 0 {
+                format!("> {}", text(m, "model"))
+            } else {
+                text(m, "model")
+            })];
+            cells.extend(
+                columns
+                    .iter()
+                    .map(|(_, key)| Cell::from(number(m.get(*key)))),
+            );
+            cells.push(Cell::from(cost(m)));
+            cells.push(Cell::from(decimal(m.get("average_first_token_ms"))));
+            cells.push(Cell::from(decimal(m.get("output_tokens_per_second"))));
+            Row::new(cells).style(if index == 0 {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            })
+        });
+    let mut constraints = vec![Constraint::Min(12)];
+    constraints.extend(
+        widths
+            .iter()
+            .map(|w| Constraint::Length(u16::try_from(*w).unwrap_or(u16::MAX))),
+    );
+    constraints.extend(
+        [cost_width, ttft_width, speed_width]
+            .into_iter()
+            .map(|w| Constraint::Length(u16::try_from(w).unwrap_or(u16::MAX))),
+    );
+    let table = Table::new(items, constraints)
+        .header(
+            Row::new([
+                "Model",
+                "Requests",
+                "Input",
+                "Output",
+                "Cache read",
+                "Cache write",
+                "Total",
+                "Est. cost",
+                "Avg TTFT ms",
+                "Output tok/s",
+            ])
             .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-    )
-    .column_spacing(1)
-    .block(panel(&title));
+        )
+        .column_spacing(1)
+        .block(panel(&title));
     frame.render_widget(table, area);
+}
+
+/// Build physical lines once for consistent rendering and scroll bounds. The
+/// detail object is deliberately never summed: provider fields may overlap.
+fn event_detail_lines(event: &Value) -> Vec<String> {
+    let mut lines = vec![
+        format!("Model: {}", text(event, "model")),
+        format!("Input: {}", number(event.get("input_tokens"))),
+        format!("Output: {}", number(event.get("output_tokens"))),
+        format!(
+            "Cache read: {}",
+            number(event.get("cache_read_input_tokens"))
+        ),
+        format!(
+            "Cache write: {}",
+            number(event.get("cache_creation_input_tokens"))
+        ),
+        format!("Total: {}", number(event.get("total_tokens"))),
+        "".into(),
+        "Provider-reported subcounts:".into(),
+        "Overlapping; do not sum.".into(),
+    ];
+    let mut details: Vec<_> = event
+        .get("token_details")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|map| map.iter())
+        .filter_map(|(key, value)| {
+            let count = value.as_i64().filter(|n| *n >= 0)?;
+            Some((clean(key), count))
+        })
+        .collect();
+    details.sort_by(|a, b| a.0.cmp(&b.0));
+    if details.is_empty() {
+        lines.push("Not reported (including older rows).".into());
+    } else {
+        let omitted = details.len().saturating_sub(256);
+        for (name, count) in details.into_iter().take(256) {
+            // Names are normally ASCII field paths. Non-ASCII names use half
+            // the minimum content width to accommodate double-width glyphs.
+            let width = if name.is_ascii() { 38 } else { 19 };
+            let chars: Vec<char> = name.chars().collect();
+            if chars.is_empty() {
+                lines.push("(unnamed field)".into());
+            }
+            for chunk in chars.chunks(width) {
+                lines.push(chunk.iter().collect());
+            }
+            lines.push(format!("  {}", number(Some(&Value::from(count)))));
+        }
+        if omitted > 0 {
+            lines.push(format!("{omitted} additional fields not shown"));
+        }
+    }
+    lines
+}
+
+/// Number of rendered detail lines for clamping keyboard scrolling.
+pub(crate) fn event_detail_line_count(event: &Value) -> usize {
+    event_detail_lines(event).len()
+}
+
+fn sessions(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
+    let rows = view
+        .sessions
+        .and_then(|s| s.get("items"))
+        .and_then(Value::as_array);
+    let Some(rows) = rows else {
+        frame.render_widget(
+            Paragraph::new("Waiting for session usage…").block(panel("Sessions")),
+            area,
+        );
+        return;
+    };
+    let total_pages = view
+        .sessions
+        .and_then(|s| s.get("total_pages"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let offset = view.session_offset.min(rows.len().saturating_sub(1));
+    let mut title = format!("Sessions · page {} / {}", view.session_page, total_pages);
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No reported usage sessions in this period.").block(panel(&title)),
+            area,
+        );
+        return;
+    }
+    let selected = &rows[offset];
+    // A previous fetch can complete after the selection changes. Never show
+    // its data as if it belonged to the newly selected session.
+    let selected_id = selected.get("session_id").and_then(Value::as_str);
+    let scoped_rates = view.session_rates.filter(|r| {
+        selected_id.is_some() && r.get("session_id").and_then(Value::as_str) == selected_id
+    });
+    let mut rolling = rate_lines(scoped_rates, usize::from(area.width.saturating_sub(2)));
+    if scoped_rates.is_none() {
+        rolling = vec!["Session rates: unavailable".into()];
+    }
+    if selected
+        .get("request_scoped_fallbacks")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0)
+    {
+        rolling.insert(
+            0,
+            "Request-ID fallback; client session not established".into(),
+        );
+    }
+    rolling = wrap_physical_lines(rolling, usize::from(area.width.saturating_sub(2)));
+    let columns = [
+        ("Requests", "request_count"),
+        ("Input", "input_tokens"),
+        ("Output", "output_tokens"),
+        ("Cache read", "cache_read_input_tokens"),
+        ("Cache write", "cache_creation_input_tokens"),
+        ("Total", "total_tokens"),
+    ];
+    let widths: Vec<usize> = columns
+        .iter()
+        .map(|(label, key)| {
+            rows.iter()
+                .map(|row| number(row.get(*key)).len())
+                .max()
+                .unwrap_or(0)
+                .max(label.len())
+        })
+        .collect();
+    let cost_width = rows
+        .iter()
+        .map(cost)
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        .max("Est. cost".len());
+    let required = 16usize + widths.iter().sum::<usize>() + cost_width + 7 + 2;
+    if usize::from(area.width) < required {
+        title.push_str(&format!(" · {} / {}", offset + 1, rows.len()));
+        let session = format!("Session: {}", text(selected, "session_id"));
+        let mut lines: Vec<String> = Vec::new();
+        // Wrap long IDs instead of silently showing the wrong/truncated session.
+        let chunk = if session.is_ascii() {
+            usize::from(area.width.saturating_sub(2)).max(1)
+        } else {
+            usize::from(area.width.saturating_sub(2)).max(1) / 2
+        };
+        let chars: Vec<char> = session.chars().collect();
+        for part in chars.chunks(chunk.max(1)) {
+            lines.push(part.iter().collect());
+        }
+        lines.extend(
+            columns
+                .iter()
+                .map(|(label, key)| format!("{label}: {}", number(selected.get(*key)))),
+        );
+        lines.push(format!("Estimated cost: {}", cost(selected)));
+        lines.push("Rolling reported counts:".into());
+        lines.extend(rolling);
+        let lines = wrap_physical_lines(lines, usize::from(area.width.saturating_sub(2)));
+        if lines.len() > usize::from(area.height.saturating_sub(2)) {
+            frame.render_widget(
+                Paragraph::new(
+                    "Resize taller or wider to show all session counts and rolling windows.",
+                )
+                .block(panel(&title))
+                .wrap(Wrap { trim: true }),
+                area,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                    .block(panel(&title)),
+                area,
+            );
+        }
+        return;
+    }
+    let rates_height = u16::try_from(rolling.len().saturating_add(2)).unwrap_or(u16::MAX);
+    if area.height < rates_height.saturating_add(5) {
+        frame.render_widget(
+            Paragraph::new("Resize taller to show session rows and rolling windows.")
+                .block(panel(&title))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+    let layout =
+        Layout::vertical([Constraint::Min(5), Constraint::Length(rates_height)]).split(area);
+    let visible = usize::from(layout[0].height.saturating_sub(3));
+    let shown = visible.min(rows.len().saturating_sub(offset));
+    if shown > 0 {
+        title.push_str(&format!(
+            " · {}–{} / {}",
+            offset + 1,
+            offset + shown,
+            rows.len()
+        ));
+    }
+    let items = rows
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .enumerate()
+        .map(|(index, row)| {
+            let mut cells = vec![Cell::from(if index == 0 {
+                format!("> {}", text(row, "session_id"))
+            } else {
+                text(row, "session_id")
+            })];
+            cells.extend(
+                columns
+                    .iter()
+                    .map(|(_, key)| Cell::from(number(row.get(*key)))),
+            );
+            cells.push(Cell::from(cost(row)));
+            Row::new(cells).style(if index == 0 {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            })
+        });
+    let mut constraints = vec![Constraint::Min(16)];
+    constraints.extend(
+        widths
+            .iter()
+            .map(|w| Constraint::Length(u16::try_from(*w).unwrap_or(u16::MAX))),
+    );
+    constraints.push(Constraint::Length(
+        u16::try_from(cost_width).unwrap_or(u16::MAX),
+    ));
+    let table = Table::new(items, constraints)
+        .header(
+            Row::new([
+                "Session",
+                "Requests",
+                "Input",
+                "Output",
+                "Cache read",
+                "Cache write",
+                "Total",
+                "Est. cost",
+            ])
+            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        )
+        .column_spacing(1)
+        .block(panel(&title));
+    frame.render_widget(table, layout[0]);
+    frame.render_widget(
+        Paragraph::new(rolling.into_iter().map(Line::from).collect::<Vec<_>>())
+            .block(panel("Selected session · rolling reported counts")),
+        layout[1],
+    );
 }
 
 fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
@@ -457,8 +1055,51 @@ fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         );
         return;
     }
-    let visible = usize::from(area.height.saturating_sub(3));
     let offset = view.event_offset.min(rows.len().saturating_sub(1));
+    if view.show_event_detail {
+        let lines = event_detail_lines(&rows[offset]);
+        let maximum = lines.len().saturating_sub(1).min(u16::MAX as usize);
+        let scroll = u16::try_from(view.detail_scroll.min(maximum)).unwrap_or(u16::MAX);
+        let detail_title = format!(
+            "Request details · {} / {} · d: list",
+            offset + 1,
+            rows.len()
+        );
+        let detail = Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            .block(panel(&detail_title))
+            .scroll((scroll, 0));
+        frame.render_widget(detail, area);
+        return;
+    }
+    // Fit every numeric value in full, or switch to one vertically arranged
+    // request. This prevents a narrow terminal from silently clipping counts.
+    let columns = [
+        ("Input", "input_tokens"),
+        ("Output", "output_tokens"),
+        ("Cache read", "cache_read_input_tokens"),
+        ("Cache write", "cache_creation_input_tokens"),
+        ("Total", "total_tokens"),
+    ];
+    let widths: Vec<u16> = columns
+        .iter()
+        .map(|(label, key)| {
+            let length = rows
+                .iter()
+                .map(|e| number(e.get(*key)).len())
+                .max()
+                .unwrap_or(0)
+                .max(label.len());
+            u16::try_from(length).unwrap_or(u16::MAX)
+        })
+        .collect();
+    // Fixed metadata columns, numeric columns, eight separators and borders.
+    let required = 14u16 + 12 + 10 + 10 + widths.iter().sum::<u16>() + 8 + 2;
+    let wide = area.width >= required;
+    let visible = if wide {
+        usize::from(area.height.saturating_sub(3))
+    } else {
+        1
+    };
     let shown = visible.min(rows.len().saturating_sub(offset));
     if shown > 0 {
         title.push_str(&format!(
@@ -468,40 +1109,107 @@ fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             rows.len()
         ));
     }
-    let items = rows.iter().skip(offset).take(visible).map(|e| {
-        let time = e
+    if !wide {
+        // Header, tabs and footer consume seven terminal rows; this area needs
+        // borders and six lines to show metadata plus all five token values.
+        if area.height < 8 {
+            frame.render_widget(
+                Paragraph::new("Resize to at least 42 × 15 to show request token details.")
+                    .block(panel(&title))
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
+        let event = &rows[offset];
+        let time = event
             .get("created_at_ms")
             .and_then(Value::as_i64)
             .and_then(|ms| Local.timestamp_millis_opt(ms).single())
             .map(|dt| dt.format("%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|| "—".into());
-        let outcome = text(e, "request_outcome");
-        let color = match outcome.as_str() {
-            "error" => Color::Red,
-            "cancelled" => Color::Yellow,
-            _ => Color::Green,
-        };
-        Row::new(vec![
-            Cell::from(time),
-            Cell::from(text(e, "model")),
-            Cell::from(text(e, "endpoint")),
-            Cell::from(number(e.get("total_tokens"))),
-            Cell::from(outcome).style(Style::default().fg(color)),
-        ])
-    });
+        let heading = format!(
+            "{} · {} · {} · {}",
+            text(event, "model"),
+            time,
+            text(event, "endpoint"),
+            text(event, "request_outcome")
+        );
+        let mut lines = vec![Line::styled(heading, Style::default().fg(ACCENT))];
+        lines.extend(
+            columns
+                .iter()
+                .map(|(label, key)| Line::from(format!("{label}: {}", number(event.get(*key))))),
+        );
+        frame.render_widget(Paragraph::new(lines).block(panel(&title)), area);
+        return;
+    }
+    let items = rows
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .enumerate()
+        .map(|(index, e)| {
+            let time = e
+                .get("created_at_ms")
+                .and_then(Value::as_i64)
+                .and_then(|ms| Local.timestamp_millis_opt(ms).single())
+                .map(|dt| dt.format("%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "—".into());
+            let outcome = text(e, "request_outcome");
+            let color = match outcome.as_str() {
+                "error" => Color::Red,
+                "cancelled" | "incomplete" => Color::Yellow,
+                _ => Color::Green,
+            };
+            Row::new(vec![
+                Cell::from(time),
+                Cell::from(if index == 0 {
+                    format!("> {}", text(e, "model"))
+                } else {
+                    text(e, "model")
+                }),
+                Cell::from(text(e, "endpoint")),
+                Cell::from(number(e.get("input_tokens"))),
+                Cell::from(number(e.get("output_tokens"))),
+                Cell::from(number(e.get("cache_read_input_tokens"))),
+                Cell::from(number(e.get("cache_creation_input_tokens"))),
+                Cell::from(number(e.get("total_tokens"))),
+                Cell::from(outcome).style(Style::default().fg(color)),
+            ])
+            .style(if index == 0 {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            })
+        });
     let table = Table::new(
         items,
         [
             Constraint::Length(14),
-            Constraint::Percentage(32),
-            Constraint::Percentage(27),
-            Constraint::Percentage(20),
-            Constraint::Percentage(21),
+            Constraint::Min(12),
+            Constraint::Length(10),
+            Constraint::Length(widths[0]),
+            Constraint::Length(widths[1]),
+            Constraint::Length(widths[2]),
+            Constraint::Length(widths[3]),
+            Constraint::Length(widths[4]),
+            Constraint::Length(10),
         ],
     )
     .header(
-        Row::new(["Local time", "Model", "Endpoint", "Tokens", "Outcome"])
-            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Row::new([
+            "Local time",
+            "Model",
+            "Endpoint",
+            "Input",
+            "Output",
+            "Cache read",
+            "Cache write",
+            "Total",
+            "Outcome",
+        ])
+        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
     )
     .column_spacing(1)
     .block(panel(&title));
@@ -527,11 +1235,19 @@ mod tests {
             summary: Some(summary),
             daily: Some(daily),
             events: Some(events),
+            sessions: None,
+            rates: None,
+            session_rates: None,
             quota: Some(quota),
             status: "ok",
             page: 1,
             model_offset: 0,
             event_offset: 0,
+            session_page: 1,
+            session_offset: 0,
+            show_event_detail: false,
+            detail_scroll: 0,
+            confirm_billing: false,
             paused: false,
             last_updated: "now",
             error: None,
@@ -603,7 +1319,7 @@ mod tests {
         let mut v = view(&summary, &null, &null, &null);
         v.tab = 2;
         v.model_offset = 1;
-        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
         terminal.draw(|f| render(f, &v)).unwrap();
         let display = render_text(&terminal);
         assert!(display.contains("second"));
@@ -614,6 +1330,60 @@ mod tests {
     }
 
     #[test]
+    fn model_breakdown_includes_cache_write_total_and_timing_without_clipping() {
+        let null = Value::Null;
+        let summary = json!({"byModel":[{"model":"example","request_count":11,"input_tokens":101,"output_tokens":202,"cache_read_input_tokens":303,"cache_creation_input_tokens":404,"total_tokens":1010,"average_first_token_ms":12.5,"output_tokens_per_second":8.75,"costs":[]} ]});
+        let mut v = view(&summary, &null, &null, &null);
+        v.tab = 2;
+        for (width, height) in [(42, 24), (80, 24), (178, 46)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| render(f, &v)).unwrap();
+            let display = render_text(&terminal);
+            for expected in [
+                "example",
+                "Requests",
+                "Input",
+                "Output",
+                "Cache read",
+                "Cache write",
+                "Total",
+                "Avg TTFT ms",
+                "Output tok/s",
+                "101",
+                "202",
+                "303",
+                "404",
+                "1,010",
+                "12.50",
+                "8.75",
+            ] {
+                assert!(
+                    display.contains(expected),
+                    "missing {expected} at {width}x{height}: {display}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_breakdown_handles_large_numbers_and_missing_metrics() {
+        let null = Value::Null;
+        let summary = json!({"byModel":[{"model":"example","input_tokens":i64::MAX,"output_tokens":null,"cache_read_input_tokens":0,"cache_creation_input_tokens":7,"total_tokens":7}]});
+        let mut v = view(&summary, &null, &null, &null);
+        v.tab = 2;
+        let mut terminal = Terminal::new(TestBackend::new(42, 24)).unwrap();
+        terminal.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&terminal);
+        assert!(display.contains("9,223,372,036,854,775,807"), "{display}");
+        assert!(display.contains("Output: —"), "{display}");
+        assert!(display.contains("Avg TTFT ms: —"), "{display}");
+        assert!(display.contains("Output tok/s: —"), "{display}");
+        let mut short = Terminal::new(TestBackend::new(42, 12)).unwrap();
+        short.draw(|f| render(f, &v)).unwrap();
+        assert!(render_text(&short).contains("Resize taller"));
+    }
+
+    #[test]
     fn event_offset_scrolls_and_clamps_within_page() {
         let null = Value::Null;
         let events = json!({"items":[{"model":"first"},{"model":"second"},{"model":"third"}],"total_pages":2});
@@ -621,7 +1391,7 @@ mod tests {
         v.tab = 3;
         v.page = 2;
         v.event_offset = 1;
-        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
         terminal.draw(|f| render(f, &v)).unwrap();
         let display = render_text(&terminal);
         assert!(display.contains("second"));
@@ -632,5 +1402,342 @@ mod tests {
         let display = render_text(&terminal);
         assert!(display.contains("third"));
         assert!(display.contains("3–3 / 3"));
+    }
+
+    #[test]
+    fn request_counts_are_separate_and_visible_in_wide_and_narrow_terminals() {
+        let null = Value::Null;
+        let events = json!({"items":[{"model":"example","endpoint":"responses","request_outcome":"completed","input_tokens":101,"output_tokens":202,"cache_read_input_tokens":303,"cache_creation_input_tokens":404,"total_tokens":1010}],"total_pages":1});
+        let mut v = view(&null, &null, &events, &null);
+        v.tab = 3;
+        for (width, height) in [(42, 24), (80, 24), (120, 24), (160, 24), (178, 46)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| render(f, &v)).unwrap();
+            let display = render_text(&terminal);
+            for expected in [
+                "Input",
+                "Output",
+                "Cache read",
+                "Cache write",
+                "Total",
+                "101",
+                "202",
+                "303",
+                "404",
+                "1,010",
+            ] {
+                assert!(
+                    display.contains(expected),
+                    "missing {expected} at width {width}: {display}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_and_missing_values_are_not_silently_truncated_or_invented() {
+        let null = Value::Null;
+        let events = json!({"items":[{"model":"example","input_tokens":i64::MAX,"output_tokens":null,"cache_read_input_tokens":3,"cache_creation_input_tokens":4,"total_tokens":10}],"total_pages":1});
+        let mut v = view(&null, &null, &events, &null);
+        v.tab = 3;
+        let mut terminal = Terminal::new(TestBackend::new(42, 20)).unwrap();
+        terminal.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&terminal);
+        assert!(display.contains("9,223,372,036,854,775,807"), "{display}");
+        assert!(display.contains("Output: —"), "{display}");
+        let mut short = Terminal::new(TestBackend::new(42, 12)).unwrap();
+        short.draw(|f| render(f, &v)).unwrap();
+        assert!(render_text(&short).contains("Resize to at least 42"));
+    }
+
+    #[test]
+    fn request_detail_shows_reported_subcounts_without_adding_them() {
+        let null = Value::Null;
+        let events = json!({"items":[
+            {"model":"first"},
+            {"model":"second","input_tokens":100,"output_tokens":20,"cache_read_input_tokens":10,"cache_creation_input_tokens":4,"total_tokens":134,
+             "token_details":{"output_tokens_details.reasoning_tokens":7,"input_tokens_details.audio_tokens":3,"bad":-1}}
+        ],"total_pages":1});
+        let mut v = view(&null, &null, &events, &null);
+        v.tab = 3;
+        v.event_offset = 1;
+        v.show_event_detail = true;
+        let mut terminal = Terminal::new(TestBackend::new(178, 46)).unwrap();
+        terminal.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&terminal);
+        for expected in [
+            "Model: second",
+            "Input: 100",
+            "Output: 20",
+            "Cache read: 10",
+            "Cache write: 4",
+            "Total: 134",
+            "Provider-reported subcounts",
+            "Overlapping; do not sum",
+            "output_tokens_details.reasoning_tokens",
+            "input_tokens_details.audio_tokens",
+        ] {
+            assert!(display.contains(expected), "missing {expected}: {display}");
+        }
+        assert!(!display.contains("bad"));
+        assert!(!display.contains("Model: first"));
+    }
+
+    #[test]
+    fn request_detail_historic_missing_and_scroll_bounds_are_explicit() {
+        let null = Value::Null;
+        let historic = json!({"model":"old","input_tokens":null});
+        let events = json!({"items":[historic.clone()],"total_pages":1});
+        let mut v = view(&null, &null, &events, &null);
+        v.tab = 3;
+        v.show_event_detail = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&terminal);
+        assert!(display.contains("Input: —"), "{display}");
+        assert!(
+            display.contains("Not reported (including older rows)"),
+            "{display}"
+        );
+        v.detail_scroll = usize::MAX;
+        terminal.draw(|f| render(f, &v)).unwrap();
+        assert!(render_text(&terminal).contains("Not reported (including older rows)"));
+        assert_eq!(event_detail_line_count(&historic), 10);
+    }
+
+    #[test]
+    fn detail_long_fields_and_values_are_bounded_on_small_terminals() {
+        let event = json!({"token_details": {"an_extremely_long_provider_reported_token_field_name_that_must_be_wrapped":i64::MAX}});
+        let lines = event_detail_lines(&event);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("9,223,372,036,854,775,807"))
+        );
+        assert!(lines.iter().all(|line| line.chars().count() <= 38));
+        let unsafe_event = json!({"token_details":{"path\u{1b}[31m":2}});
+        assert!(
+            event_detail_lines(&unsafe_event)
+                .iter()
+                .all(|line| !line.contains('\u{1b}'))
+        );
+    }
+
+    #[test]
+    fn selected_request_is_marked_and_incomplete_is_yellow() {
+        let null = Value::Null;
+        let events = json!({"items":[{"model":"first"},{"model":"selected","request_outcome":"incomplete","total_tokens":3}],"total_pages":1});
+        let mut v = view(&null, &null, &events, &null);
+        v.tab = 3;
+        v.event_offset = 1;
+        let mut terminal = Terminal::new(TestBackend::new(178, 46)).unwrap();
+        terminal.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&terminal);
+        assert!(display.contains("> selected"), "{display}");
+        let (y, line) = display
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("incomplete"))
+            .unwrap();
+        let index = line.find("incomplete").unwrap();
+        let x = line[..index].chars().count();
+        let cell = &terminal.backend().buffer()[(x as u16, y as u16)];
+        assert_eq!(cell.fg, Color::Yellow);
+        assert_eq!(cell.bg, Color::DarkGray);
+    }
+
+    #[test]
+    fn rolling_overview_displays_reported_counts_and_does_not_invent_missing_windows() {
+        let null = Value::Null;
+        let rates = json!({"windows":[
+            {"id":"minute","duration_seconds":60,"totals":{"request_count":11,"total_tokens":111,"costs":[]}},
+            {"id":"hour","duration_seconds":3600,"totals":{"request_count":22,"total_tokens":222,"costs":[]}}
+        ]});
+        let mut v = view(&null, &null, &null, &null);
+        v.rates = Some(&rates);
+        for (width, height) in [(42, 24), (178, 46)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| render(f, &v)).unwrap();
+            let display = render_text(&terminal);
+            assert!(display.contains("Rolling reported counts"), "{display}");
+            assert!(display.contains("1m: 11 req / 111 tok"), "{display}");
+            assert!(display.contains("1h: 22 req / 222 tok"), "{display}");
+            assert!(display.contains("24h: —"), "{display}");
+        }
+    }
+
+    #[test]
+    fn sessions_display_breakdowns_and_only_the_selected_sessions_rates() {
+        let null = Value::Null;
+        let sessions_data = json!({"items":[
+            {"session_id":"first","request_count":1,"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40,"total_tokens":100,"costs":[]},
+            {"session_id":"selected","request_count":2,"input_tokens":101,"output_tokens":202,"cache_read_input_tokens":303,"cache_creation_input_tokens":404,"total_tokens":1010,"costs":[]}
+        ],"total_pages":2});
+        let rates = json!({"session_id":"selected","windows":[
+            {"id":"minute","duration_seconds":60,"totals":{"request_count":12,"total_tokens":120,"costs":[]}},
+            {"id":"hour","duration_seconds":3600,"totals":{"request_count":23,"total_tokens":230,"costs":[]}},
+            {"id":"day","duration_seconds":86400,"totals":{"request_count":34,"total_tokens":340,"costs":[]}}
+        ]});
+        let mut v = view(&null, &null, &null, &null);
+        v.tab = 4;
+        v.session_page = 2;
+        v.session_offset = 1;
+        v.sessions = Some(&sessions_data);
+        v.session_rates = Some(&rates);
+        for (width, height) in [(42, 30), (100, 30), (178, 46)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| render(f, &v)).unwrap();
+            let display = render_text(&terminal);
+            for expected in [
+                "Sessions",
+                "page 2 / 2",
+                "selected",
+                "101",
+                "202",
+                "303",
+                "404",
+                "1,010",
+                "12 req / 120 tok",
+                "23 req / 230 tok",
+                "34 req / 340 tok",
+            ] {
+                assert!(
+                    display.contains(expected),
+                    "missing {expected} at {width}x{height}: {display}"
+                );
+            }
+        }
+        let stale = json!({"session_id":"first","windows":[{"id":"minute","duration_seconds":60,"totals":{"request_count":9999,"total_tokens":9999}}]});
+        v.session_rates = Some(&stale);
+        let mut terminal = Terminal::new(TestBackend::new(178, 46)).unwrap();
+        terminal.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&terminal);
+        assert!(display.contains("Session rates: unavailable"), "{display}");
+        assert!(!display.contains("9,999"));
+    }
+
+    #[test]
+    fn quota_counts_show_reported_values_without_inventing_units_or_remaining() {
+        let null = Value::Null;
+        let quota = json!({"tokenBasedBilling":true,"windows":[
+            {"name":"Premium","unit":"requests","used":400.0,"limit":1000.0,"remaining":600.0,"reportedQuotaRemaining":600.25,"usedPercent":40.0,"resetDate":"2026-12-01"},
+            {"name":"Chat","unit":"requests","unlimited":true},
+            {"name":"Completions","unit":"requests","used":11.0,"limit":40.0,"usedPercent":27.5}
+        ]});
+        let mut v = view(&null, &null, &null, &quota);
+        v.tab = 1;
+        for (width, height) in [(42, 24), (80, 24), (178, 46)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| render(f, &v)).unwrap();
+            let display = render_text(&terminal);
+            for expected in [
+                "Token-based billing; unit unconfirmed",
+                "Premium",
+                "Used (derived): 400 / Limit: 1,000",
+                "Remaining: 600",
+                "quota_remaining: 600.25",
+                "reset: 2026-12-01",
+                "25.7164% used",
+                "Chat",
+                "Limit: Unlimited",
+                "Completions",
+                "Used (derived): 11 / Limit: 40",
+                "Remaining: —",
+            ] {
+                assert!(
+                    display.contains(expected),
+                    "missing {expected} at {width}x{height}: {display}"
+                );
+            }
+            assert!(
+                !display.contains("requests"),
+                "unsupported unit claim: {display}"
+            );
+            assert!(
+                !display.contains("Remaining: 29"),
+                "inferred remaining: {display}"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_preserves_other_reported_units_and_explicit_missing_values() {
+        let null = Value::Null;
+        let quota = json!({"windows":[{"name":"Premium","unit":"credits","remaining":12.5,"usedPercent":10.0}]});
+        let mut v = view(&null, &null, &null, &quota);
+        v.tab = 1;
+        let mut terminal = Terminal::new(TestBackend::new(178, 46)).unwrap();
+        terminal.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&terminal);
+        for expected in [
+            "Premium",
+            "Premium · credits · reset: —",
+            "Used (derived): — / Limit: —",
+            "Remaining: 12.5",
+            "reset: —",
+            "10% used",
+        ] {
+            assert!(display.contains(expected), "missing {expected}: {display}");
+        }
+        assert_eq!(quota_quantity(Some(&json!(-0.25))), "-0.25");
+        assert_eq!(quota_quantity(Some(&json!(600.25))), "600.25");
+    }
+
+    #[test]
+    fn billing_action_requires_an_explicit_confirmation_prompt() {
+        let null = Value::Null;
+        let mut v = view(&null, &null, &null, &null);
+        v.tab = 1;
+        let mut wide = Terminal::new(TestBackend::new(178, 46)).unwrap();
+        wide.draw(|f| render(f, &v)).unwrap();
+        assert!(render_text(&wide).contains("b billing settings"));
+        assert!(!render_text(&wide).contains("y open / n cancel"));
+        v.confirm_billing = true;
+        wide.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&wide);
+        for expected in [
+            "Open GitHub Copilot billing settings?",
+            "y open / n cancel",
+            "Selection changes are made by you in GitHub;",
+            "this gateway does not switch",
+            "automatically.",
+            "https://github.com/settings/copilot/features",
+        ] {
+            assert!(display.contains(expected), "missing {expected}: {display}");
+        }
+        for height in [10, 12] {
+            let mut narrow = Terminal::new(TestBackend::new(42, height)).unwrap();
+            narrow.draw(|f| render(f, &v)).unwrap();
+            let display = render_text(&narrow);
+            assert!(display.contains("y open / n cancel"), "{display}");
+            assert!(
+                display.contains("Selection changes are made by you"),
+                "{display}"
+            );
+            assert!(
+                display.contains("this gateway does not switch"),
+                "{display}"
+            );
+            assert!(display.contains("automatically."), "{display}");
+            assert!(
+                display.contains("github.com/settings/copilot/feat"),
+                "{display}"
+            );
+            assert!(display.contains("ures"), "{display}");
+        }
+    }
+
+    #[test]
+    fn session_request_id_fallback_is_not_mislabeled_as_known_session() {
+        let null = Value::Null;
+        let sessions_data = json!({"items":[{"session_id":"request-id", "request_scoped_fallbacks":1}],"total_pages":1});
+        let mut v = view(&null, &null, &null, &null);
+        v.tab = 4;
+        v.sessions = Some(&sessions_data);
+        let mut terminal = Terminal::new(TestBackend::new(178, 46)).unwrap();
+        terminal.draw(|f| render(f, &v)).unwrap();
+        assert!(
+            render_text(&terminal).contains("Request-ID fallback; client session not established")
+        );
     }
 }

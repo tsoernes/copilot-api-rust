@@ -2,8 +2,9 @@
 //!
 //! This store has its own schema and must not silently migrate an upstream
 //! TypeScript database. It records only usage actually reported by a provider.
-use std::{path::Path, sync::Mutex, time::Duration};
+use std::{collections::BTreeMap, path::Path, sync::Mutex, time::Duration};
 
+use crate::usage_details::{MAX_DETAIL_FIELDS, MAX_DETAIL_KEY_LEN};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Datelike, Days, Local, NaiveDate, SecondsFormat, TimeZone, Utc};
 use rusqlite::{Connection, params};
@@ -13,6 +14,8 @@ const APPLICATION_ID: i64 = 0x43505255; // "CPRU"
 const SCHEMA_VERSION: i64 = 1;
 // Fail explicitly rather than silently truncating an abnormally large daily report.
 const MAX_DAILY_BUCKETS: usize = 3660;
+const MAX_TOKEN_DETAILS_JSON_BYTES: usize = 8192;
+const MAX_RATE_SESSION_ID_BYTES: usize = 1024;
 
 /// One upstream-reported usage observation. All-zero tokens without reported AIU are ignored.
 /// Times are milliseconds; token counts are nonnegative integers.
@@ -35,6 +38,9 @@ pub struct UsageEvent {
     pub duration_ms: Option<i64>,
     pub first_token_ms: Option<i64>,
     pub request_outcome: Option<String>,
+    /// Optional provider-reported nested token counters, keyed by wire path.
+    /// These may overlap aggregate counters and must not be added to totals.
+    pub token_details: Option<BTreeMap<String, i64>>,
 }
 
 pub struct UsageStore {
@@ -47,6 +53,22 @@ fn iso(ms: i64) -> Result<String> {
         .single()
         .ok_or_else(|| anyhow!("invalid timestamp"))?;
     Ok(dt.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
+fn valid_token_details(details: &BTreeMap<String, i64>) -> bool {
+    details.len() <= MAX_DETAIL_FIELDS
+        && details.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= MAX_DETAIL_KEY_LEN
+                && !key.chars().any(char::is_control)
+                && *value >= 0
+        })
+}
+
+fn parse_token_details(raw: Option<String>) -> Option<BTreeMap<String, i64>> {
+    let raw = raw.filter(|raw| raw.len() <= MAX_TOKEN_DETAILS_JSON_BYTES)?;
+    let details: BTreeMap<String, i64> = serde_json::from_str(&raw).ok()?;
+    valid_token_details(&details).then_some(details)
 }
 
 impl UsageStore {
@@ -96,7 +118,8 @@ impl UsageStore {
                 input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
                 cache_read_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL, total_nano_aiu INTEGER,
-                duration_ms INTEGER, first_token_ms INTEGER, request_outcome TEXT
+                duration_ms INTEGER, first_token_ms INTEGER, request_outcome TEXT,
+                token_details TEXT
             );
             CREATE INDEX rust_usage_time ON rust_usage_events(created_at_ms, id);
             CREATE INDEX rust_usage_request ON rust_usage_events(request_id);
@@ -107,6 +130,36 @@ impl UsageStore {
         }
         // Validate expected columns before accepting a purportedly compatible DB.
         db.prepare("SELECT id, created_at_ms, trace_id, session_id, request_id, user_agent, endpoint, model, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, total_tokens, total_nano_aiu, duration_ms, first_token_ms, request_outcome FROM rust_usage_events LIMIT 0")?;
+        // Additive migration: retain the original app ID, version, rows and
+        // columns so the previous binary can continue reading and writing.
+        // Recheck the column under a write transaction to serialize migrations.
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let detail_column = {
+            let mut columns = tx.prepare("PRAGMA table_info(rust_usage_events)")?;
+            let names = columns.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            names
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .find(|(name, _, _, _)| name == "token_details")
+        };
+        match detail_column {
+            None => {
+                tx.execute_batch("ALTER TABLE rust_usage_events ADD COLUMN token_details TEXT")?
+            }
+            Some((_, column_type, not_null, primary_key))
+                if column_type.eq_ignore_ascii_case("TEXT")
+                    && not_null == 0
+                    && primary_key == 0 => {}
+            Some(_) => bail!("usage database token_details column has an unsupported schema"),
+        }
+        tx.commit()?;
         Ok(Self { db: Mutex::new(db) })
     }
 
@@ -132,6 +185,20 @@ impl UsageStore {
         {
             bail!("usage values must be nonnegative");
         }
+        let details = event
+            .token_details
+            .as_ref()
+            .map(|details| {
+                if !valid_token_details(details) {
+                    bail!("invalid token detail counters");
+                }
+                let json = serde_json::to_string(details)?;
+                if json.len() > MAX_TOKEN_DETAILS_JSON_BYTES {
+                    bail!("token detail counters exceed size limit");
+                }
+                Ok(json)
+            })
+            .transpose()?;
         if numbers.iter().all(|&n| n == 0) && event.total_nano_aiu.is_none() {
             return Ok(());
         }
@@ -144,8 +211,8 @@ impl UsageStore {
         }
         event.user_agent = event.user_agent.chars().take(64).collect();
         let db = self.lock()?;
-        db.execute("INSERT INTO rust_usage_events (created_at_ms,trace_id,session_id,request_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens,total_nano_aiu,duration_ms,first_token_ms,request_outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![event.created_at_ms,event.trace_id,event.session_id,event.request_id,event.user_agent,event.endpoint,event.model,event.input_tokens,event.output_tokens,event.cache_read_input_tokens,event.cache_creation_input_tokens,event.total_tokens,event.total_nano_aiu,event.duration_ms,event.first_token_ms,event.request_outcome])?;
+        db.execute("INSERT INTO rust_usage_events (created_at_ms,trace_id,session_id,request_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens,total_nano_aiu,duration_ms,first_token_ms,request_outcome,token_details) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![event.created_at_ms,event.trace_id,event.session_id,event.request_id,event.user_agent,event.endpoint,event.model,event.input_tokens,event.output_tokens,event.cache_read_input_tokens,event.cache_creation_input_tokens,event.total_tokens,event.total_nano_aiu,event.duration_ms,event.first_token_ms,event.request_outcome,details])?;
         Ok(())
     }
 
@@ -192,6 +259,39 @@ impl UsageStore {
         )
     }
 
+    /// Rolling, fixed-duration windows of persisted, provider-reported events.
+    /// A session filter is exact; None means all sessions. The result shares a
+    /// single timestamp and snapshot so windows cannot disagree across writes.
+    pub fn rates(&self, session_id: Option<&str>) -> Result<Value> {
+        self.rates_at(session_id, Utc::now().timestamp_millis())
+    }
+
+    fn rates_at(&self, session_id: Option<&str>, as_of_ms: i64) -> Result<Value> {
+        if session_id.is_some_and(|id| {
+            id.len() > MAX_RATE_SESSION_ID_BYTES || id.chars().any(char::is_control)
+        }) {
+            bail!("invalid usage session identifier");
+        }
+        let db = self.lock()?;
+        let tx = db.unchecked_transaction()?;
+        let sql = format!(
+            "SELECT {} FROM rust_usage_events WHERE created_at_ms>=? AND created_at_ms<=? AND (? IS NULL OR session_id=?)",
+            totals_sql()
+        );
+        let mut windows = Vec::with_capacity(3);
+        for (id, seconds) in [("minute", 60_i64), ("hour", 3600_i64), ("day", 86400_i64)] {
+            let start_ms = as_of_ms.saturating_sub(seconds * 1000);
+            let totals = tx.query_row(
+                &sql,
+                params![start_ms, as_of_ms, session_id, session_id],
+                |row| totals_from_row(row, 0),
+            )?;
+            windows.push(json!({"id":id,"duration_seconds":seconds,"totals":totals}));
+        }
+        tx.commit()?;
+        Ok(json!({"as_of_ms":as_of_ms,"session_id":session_id,"windows":windows}))
+    }
+
     pub fn events(&self, period: &str, page: usize, page_size: usize) -> Result<Value> {
         let db = self.lock()?;
         let (period, start, end) = range(&db, period)?;
@@ -201,7 +301,7 @@ impl UsageStore {
             params![start, end],
             |r| r.get(0),
         )?;
-        let mut stmt = db.prepare("SELECT id,created_at_ms,trace_id,session_id,request_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens,total_nano_aiu,duration_ms,first_token_ms,request_outcome,(SELECT count(*) FROM rust_usage_events AS siblings WHERE siblings.request_id=rust_usage_events.request_id) FROM rust_usage_events WHERE created_at_ms>=? AND created_at_ms<? ORDER BY created_at_ms DESC,id DESC LIMIT ? OFFSET ?")?;
+        let mut stmt = db.prepare("SELECT id,created_at_ms,trace_id,session_id,request_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens,total_nano_aiu,duration_ms,first_token_ms,request_outcome,(SELECT count(*) FROM rust_usage_events AS siblings WHERE siblings.request_id=rust_usage_events.request_id),CASE WHEN typeof(token_details)='text' AND length(token_details)<=8192 THEN token_details ELSE NULL END FROM rust_usage_events WHERE created_at_ms>=? AND created_at_ms<? ORDER BY created_at_ms DESC,id DESC LIMIT ? OFFSET ?")?;
         let rows = stmt.query_map(params![start,end,size,offset], |r| {
             let created_at_ms: i64=r.get(1)?;
             let output: i64=r.get(9)?;
@@ -210,6 +310,7 @@ impl UsageStore {
             let outcome: Option<String>=r.get(16)?;
             let siblings: i64=r.get(17)?;
             let aiu: Option<i64> = r.get(13)?;
+            let token_details = parse_token_details(r.get(18)?);
             let cost = aiu.map(|n| {
                 let nanos = n / 100 + i64::from(n % 100 >= 50);
                 json!({"currency":"USD", "source":"copilot_aiu", "total_cost_nanos":nanos, "amount":nanos as f64 / 1_000_000_000.0})
@@ -217,7 +318,7 @@ impl UsageStore {
             let speed=if outcome.as_deref()==Some("completed") && siblings==1 && output>0 {
                 duration.zip(first).and_then(|(d,f)| if d>f {Some(output as f64*1000.0/(d-f) as f64)} else {None})
             } else {None};
-            Ok(json!({"id":r.get::<_,i64>(0)?,"created_at_ms":created_at_ms,"created_at_utc":iso(created_at_ms).ok(),"trace_id":r.get::<_,String>(2)?,"session_id":r.get::<_,String>(3)?,"request_id":r.get::<_,Option<String>>(4)?,"user_agent":r.get::<_,String>(5)?,"endpoint":r.get::<_,String>(6)?,"model":r.get::<_,String>(7)?,"input_tokens":r.get::<_,i64>(8)?,"output_tokens":output,"cache_read_input_tokens":r.get::<_,i64>(10)?,"cache_creation_input_tokens":r.get::<_,i64>(11)?,"total_tokens":r.get::<_,i64>(12)?,"total_nano_aiu":aiu,"duration_ms":duration,"first_token_ms":first,"request_outcome":outcome,"output_tokens_per_second":speed,"api_key_id":null,"api_key_name":null,"source":"copilot","provider_name":null,"user_id":"","cost":cost}))
+            Ok(json!({"id":r.get::<_,i64>(0)?,"created_at_ms":created_at_ms,"created_at_utc":iso(created_at_ms).ok(),"trace_id":r.get::<_,String>(2)?,"session_id":r.get::<_,String>(3)?,"request_id":r.get::<_,Option<String>>(4)?,"user_agent":r.get::<_,String>(5)?,"endpoint":r.get::<_,String>(6)?,"model":r.get::<_,String>(7)?,"input_tokens":r.get::<_,i64>(8)?,"output_tokens":output,"cache_read_input_tokens":r.get::<_,i64>(10)?,"cache_creation_input_tokens":r.get::<_,i64>(11)?,"total_tokens":r.get::<_,i64>(12)?,"total_nano_aiu":aiu,"duration_ms":duration,"first_token_ms":first,"request_outcome":outcome,"output_tokens_per_second":speed,"api_key_id":null,"api_key_name":null,"source":"copilot","provider_name":null,"user_id":"","cost":cost,"token_details":token_details}))
         })?;
         let items: Vec<Value> = rows.collect::<rusqlite::Result<_>>()?;
         page_json(items, page, size, total, period, start, end)
@@ -229,7 +330,7 @@ impl UsageStore {
         let (page, size, offset) = page_args(page, page_size);
         let total: i64 = db.query_row("SELECT count(DISTINCT session_id) FROM rust_usage_events WHERE created_at_ms>=? AND created_at_ms<?",params![start,end],|r|r.get(0))?;
         let sql = format!(
-            "SELECT session_id,{} FROM rust_usage_events WHERE created_at_ms>=? AND created_at_ms<? GROUP BY session_id ORDER BY sum(total_tokens) DESC,session_id ASC LIMIT ? OFFSET ?",
+            "SELECT session_id,{}, SUM(CASE WHEN request_id IS NOT NULL AND session_id=request_id THEN 1 ELSE 0 END) FROM rust_usage_events WHERE created_at_ms>=? AND created_at_ms<? GROUP BY session_id ORDER BY sum(total_tokens) DESC,session_id ASC LIMIT ? OFFSET ?",
             totals_sql()
         );
         let mut stmt = db.prepare(&sql)?;
@@ -238,6 +339,9 @@ impl UsageStore {
                 let session_id: String = r.get(0)?;
                 let mut item = totals_from_row(r, 1)?;
                 item["session_id"] = json!(session_id);
+                // This indicates the gateway's request-ID fallback, not an
+                // independently observed conversation/session identifier.
+                item["request_scoped_fallbacks"] = json!(r.get::<_, i64>(9)?);
                 Ok(item)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -415,6 +519,105 @@ mod tests {
     }
 
     #[test]
+    fn session_totals_label_request_id_fallbacks() -> Result<()> {
+        let store = UsageStore::in_memory()?;
+        let mut fallback = event("model", "request-id", 3);
+        fallback.request_id = Some("request-id".into());
+        store.record(fallback)?;
+        let mut grouped = event("model", "client-session", 4);
+        grouped.request_id = Some("different-request-id".into());
+        store.record(grouped)?;
+        let sessions = store.sessions("lifetime", 1, 20)?;
+        let rows = sessions["items"].as_array().unwrap();
+        let fallback = rows
+            .iter()
+            .find(|row| row["session_id"] == "request-id")
+            .unwrap();
+        let grouped = rows
+            .iter()
+            .find(|row| row["session_id"] == "client-session")
+            .unwrap();
+        assert_eq!(fallback["request_scoped_fallbacks"], 1);
+        assert_eq!(grouped["request_scoped_fallbacks"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rolling_rates_are_inclusive_bounded_and_session_filtered() -> Result<()> {
+        let store = UsageStore::in_memory()?;
+        let now = 1_800_000_000_000_i64;
+        for (elapsed_ms, session, amount, aiu) in [
+            (0, "one", 10, Some(100)),
+            (60_000, "one", 20, None),
+            (60_001, "two", 30, None),
+            (3_600_000, "two", 40, None),
+            (86_400_000, "one", 50, None),
+            (86_400_001, "one", 60, None),
+            (-1, "one", 70, None),
+        ] {
+            let mut item = event("m", session, amount);
+            item.created_at_ms = now - elapsed_ms;
+            item.total_nano_aiu = aiu;
+            store.record(item)?;
+        }
+        let all = store.rates_at(None, now)?;
+        assert_eq!(all["as_of_ms"], now);
+        assert_eq!(all["session_id"], Value::Null);
+        assert_eq!(all["windows"][0]["id"], "minute");
+        assert_eq!(all["windows"][0]["duration_seconds"], 60);
+        assert_eq!(all["windows"][0]["totals"]["request_count"], 2);
+        assert_eq!(all["windows"][0]["totals"]["total_tokens"], 34);
+        assert_eq!(
+            all["windows"][0]["totals"]["costs"][0]["total_cost_nanos"],
+            1
+        );
+        assert_eq!(all["windows"][1]["totals"]["request_count"], 4);
+        assert_eq!(all["windows"][2]["totals"]["request_count"], 5);
+        let session = store.rates_at(Some("one"), now)?;
+        assert_eq!(session["session_id"], "one");
+        assert_eq!(session["windows"][2]["totals"]["request_count"], 3);
+        assert_eq!(session["windows"][2]["totals"]["total_tokens"], 86);
+        let unpriced = store.rates_at(Some("two"), now)?;
+        assert_eq!(unpriced["windows"][1]["totals"]["request_count"], 2);
+        assert_eq!(unpriced["windows"][1]["totals"]["costs"], json!([]));
+        assert_eq!(
+            store.rates_at(Some("not-found"), now)?["windows"][0]["totals"]["request_count"],
+            0
+        );
+        assert_eq!(
+            store.rates_at(Some("one' OR 1=1 --"), now)?["windows"][0]["totals"]["request_count"],
+            0
+        );
+        assert!(
+            store
+                .rates_at(Some(&"x".repeat(MAX_RATE_SESSION_ID_BYTES + 1)), now)
+                .is_err()
+        );
+        assert!(store.rates_at(Some("x\ny"), now).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rolling_rates_persist_and_reopen() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("copilot-rust-rates-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("usage.sqlite");
+        {
+            let store = UsageStore::open(&path)?;
+            store.record(event("model", "session", 12))?;
+        }
+        {
+            let store = UsageStore::open(&path)?;
+            let rate = store.rates(Some("session"))?;
+            assert_eq!(rate["windows"][0]["totals"]["request_count"], 1);
+            assert_eq!(rate["windows"][0]["totals"]["total_tokens"], 14);
+            assert_eq!(rate["windows"][0]["totals"]["costs"], json!([]));
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn events_are_paginated_capped_sorted_and_have_nullable_timing() -> Result<()> {
         let store = UsageStore::in_memory()?;
         let mut first = event("a", "s", 1);
@@ -467,6 +670,168 @@ mod tests {
             store.summary("lifetime")?["totals"]["costs"][0]["total_cost_nanos"],
             0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn token_details_roundtrip_validate_and_ignore_malformed_storage() -> Result<()> {
+        let store = UsageStore::in_memory()?;
+        let mut sample = event("a", "s", 3);
+        sample.token_details = Some(BTreeMap::from([
+            ("output_tokens_details.reasoning_tokens".into(), 5),
+            ("cache_creation.ephemeral_5m_input_tokens".into(), 0),
+        ]));
+        store.record(sample.clone())?;
+        let events = store.events("lifetime", 1, 20)?;
+        assert_eq!(
+            events["items"][0]["token_details"]["output_tokens_details.reasoning_tokens"],
+            5
+        );
+        assert_eq!(
+            events["items"][0]["token_details"]["cache_creation.ephemeral_5m_input_tokens"],
+            0
+        );
+        assert_eq!(store.summary("lifetime")?["totals"]["total_tokens"], 5);
+
+        sample.token_details = Some(BTreeMap::from([("bad".into(), -1)]));
+        assert!(store.record(sample.clone()).is_err());
+        sample.token_details = Some(
+            (0..=MAX_DETAIL_FIELDS)
+                .map(|i| (format!("k{i}"), 1))
+                .collect(),
+        );
+        assert!(store.record(sample.clone()).is_err());
+        sample.token_details = Some(BTreeMap::from([("x".repeat(MAX_DETAIL_KEY_LEN + 1), 1)]));
+        assert!(store.record(sample).is_err());
+
+        // A malformed or hostile optional detail column must not hide otherwise
+        // valid historical usage rows or turn missing into zero.
+        for raw in [
+            "{not json".to_owned(),
+            "{\"x\":-1}".to_owned(),
+            "x".repeat(MAX_TOKEN_DETAILS_JSON_BYTES + 1),
+        ] {
+            store
+                .lock()?
+                .execute("UPDATE rust_usage_events SET token_details=?", [raw])?;
+            assert_eq!(
+                store.events("lifetime", 1, 20)?["items"][0]["token_details"],
+                Value::Null
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn additive_v1_migration_preserves_rows_and_old_writes() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("copilot-rust-v1-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("usage.sqlite");
+        let now = Utc::now().timestamp_millis();
+        {
+            let db = Connection::open(&path)?;
+            db.execute_batch("CREATE TABLE rust_usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, created_at_ms INTEGER NOT NULL,
+                trace_id TEXT NOT NULL, session_id TEXT NOT NULL, request_id TEXT,
+                user_agent TEXT NOT NULL, endpoint TEXT NOT NULL, model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+                cache_read_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL, total_nano_aiu INTEGER,
+                duration_ms INTEGER, first_token_ms INTEGER, request_outcome TEXT
+            );
+            CREATE INDEX rust_usage_time ON rust_usage_events(created_at_ms, id);
+            CREATE INDEX rust_usage_request ON rust_usage_events(request_id);
+            PRAGMA application_id=1129337429; PRAGMA user_version=1;")?;
+            db.execute("INSERT INTO rust_usage_events(created_at_ms,trace_id,session_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens) VALUES (?, 'old-trace', 'old-session', '', 'responses', 'old-model', 4, 2, 1, 0, 7)", [now])?;
+        }
+        {
+            let store = UsageStore::open(&path)?;
+            let old = store.events("lifetime", 1, 20)?;
+            assert_eq!(old["items"][0]["model"], "old-model");
+            assert_eq!(old["items"][0]["token_details"], Value::Null);
+            let mut sample = event("new-model", "new-session", 3);
+            sample.token_details = Some(BTreeMap::from([(
+                "output_tokens_details.reasoning_tokens".into(),
+                2,
+            )]));
+            store.record(sample)?;
+        }
+        // Simulate the original binary's INSERT with no new column; SQLite
+        // must continue to accept it with the original user_version and app ID.
+        {
+            let db = Connection::open(&path)?;
+            assert_eq!(
+                db.pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))?,
+                APPLICATION_ID
+            );
+            assert_eq!(
+                db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+                SCHEMA_VERSION
+            );
+            db.execute("INSERT INTO rust_usage_events(created_at_ms,trace_id,session_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens) VALUES (?, 'old-writer', '', '', 'responses', 'later-old', 2, 1, 0, 0, 3)", [now])?;
+        }
+        {
+            let store = UsageStore::open(&path)?;
+            let events = store.events("lifetime", 1, 20)?;
+            assert_eq!(events["total"], 3);
+            let rows = events["items"].as_array().unwrap();
+            let old = rows.iter().find(|row| row["model"] == "old-model").unwrap();
+            assert_eq!(old["input_tokens"], 4);
+            assert_eq!(old["token_details"], Value::Null);
+            let later = rows.iter().find(|row| row["model"] == "later-old").unwrap();
+            assert_eq!(later["token_details"], Value::Null);
+            let new = rows.iter().find(|row| row["model"] == "new-model").unwrap();
+            assert_eq!(
+                new["token_details"]["output_tokens_details.reasoning_tokens"],
+                2
+            );
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_incompatible_detail_column_without_mutating_database() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "copilot-rust-v1-incompatible-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("usage.sqlite");
+        let db = Connection::open(&path)?;
+        db.execute_batch(
+            "CREATE TABLE rust_usage_events (
+            id INTEGER PRIMARY KEY, created_at_ms INTEGER NOT NULL,
+            trace_id TEXT NOT NULL, session_id TEXT NOT NULL, request_id TEXT,
+            user_agent TEXT NOT NULL, endpoint TEXT NOT NULL, model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+            cache_read_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL, total_nano_aiu INTEGER,
+            duration_ms INTEGER, first_token_ms INTEGER, request_outcome TEXT,
+            token_details INTEGER NOT NULL
+        );
+        INSERT INTO rust_usage_events(created_at_ms,trace_id,session_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens,token_details) VALUES (10,'t','s','','responses','m',1,2,0,0,3,99);
+        PRAGMA application_id=1129337429; PRAGMA user_version=1;",
+        )?;
+        drop(db);
+        assert!(UsageStore::open(&path).is_err());
+        let db = Connection::open(&path)?;
+        assert_eq!(
+            db.query_row("SELECT token_details FROM rust_usage_events", [], |row| row
+                .get::<_, i64>(0))?,
+            99
+        );
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            db.pragma_query_value(None, "application_id", |row| row.get::<_, i64>(0))?,
+            APPLICATION_ID
+        );
+        drop(db);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

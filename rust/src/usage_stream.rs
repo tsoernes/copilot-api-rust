@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     usage::{UsageEvent, UsageStore},
-    usage_observer::UsageObserver,
+    usage_observer::{StreamTerminal, UsageObserver},
 };
 
 pub(crate) struct UsageStream {
@@ -52,7 +52,13 @@ impl UsageStream {
         let Some(observer) = self.observer.take() else {
             return;
         };
-        let protocol_error = observer.protocol_error();
+        let terminal = observer.terminal();
+        let expects_terminal = observer.expects_terminal();
+        if observer.monthly_quota_exceeded() {
+            tracing::error!(
+                "Copilot reported monthly quota exhausted; automatic payer switching is unavailable. Use Quota > b to open GitHub billing settings."
+            );
+        }
         let Some(observed) = observer.finish() else {
             return;
         };
@@ -71,14 +77,21 @@ impl UsageStream {
                 .saturating_add(event.cache_creation_input_tokens)
         });
         event.total_nano_aiu = observed.total_nano_aiu;
+        if !observed.token_details.is_empty() {
+            event.token_details = Some(observed.token_details);
+        }
         event.first_token_ms = observed.first_token_ms;
         event.duration_ms =
             Some(i64::try_from(self.start.elapsed().as_millis()).unwrap_or(i64::MAX));
         event.request_outcome = Some(
-            if disposition == "cancelled" {
-                "cancelled"
-            } else if disposition == "error" || protocol_error || !self.http_success {
+            if disposition == "error" || observed.protocol_error || !self.http_success {
                 "error"
+            } else if terminal == Some(StreamTerminal::Incomplete) {
+                "incomplete"
+            } else if disposition == "cancelled" && terminal != Some(StreamTerminal::Completed) {
+                "cancelled"
+            } else if disposition == "completed" && expects_terminal && terminal.is_none() {
+                "incomplete"
             } else {
                 "completed"
             }
@@ -150,6 +163,171 @@ impl Drop for UsageStream {
     fn drop(&mut self) {
         if !self.done && self.observer.is_some() {
             self.save("cancelled");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{StreamExt, stream};
+    use std::time::Duration;
+
+    async fn dropped_outcome(
+        endpoint: &str,
+        fragments: Vec<&'static [u8]>,
+        http_success: bool,
+    ) -> String {
+        let store = Arc::new(UsageStore::in_memory().unwrap());
+        let count = fragments.len();
+        let source = stream::iter(
+            fragments
+                .into_iter()
+                .map(|bytes| Ok::<Bytes, reqwest::Error>(Bytes::from_static(bytes))),
+        )
+        .chain(stream::pending());
+        let event = UsageEvent {
+            endpoint: endpoint.into(),
+            model: "mock".into(),
+            ..UsageEvent::default()
+        };
+        let mut observed = UsageStream::new(
+            source,
+            store.clone(),
+            event,
+            true,
+            Instant::now(),
+            http_success,
+        );
+        for _ in 0..count {
+            observed.next().await.unwrap().unwrap();
+        }
+        // Simulates a real SSE client closing immediately after a complete frame,
+        // while the upstream body is still open and has not produced EOF.
+        drop(observed);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let events = store.events("lifetime", 1, 10).unwrap();
+                if events["total"] == 1 {
+                    return events["items"][0]["request_outcome"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn clients_stopping_after_protocol_terminal_are_not_cancelled() {
+        let chat = vec![
+            b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n".as_slice(),
+            b"data: [DO".as_slice(),
+            b"NE]\n\n".as_slice(),
+        ];
+        assert_eq!(
+            dropped_outcome("chat_completions", chat, true).await,
+            "completed"
+        );
+        let responses = vec![b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}}\n\n".as_slice()];
+        assert_eq!(
+            dropped_outcome("responses", responses, true).await,
+            "completed"
+        );
+        let incomplete = vec![b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}}\n\n".as_slice()];
+        assert_eq!(
+            dropped_outcome("responses", incomplete, true).await,
+            "incomplete"
+        );
+        let incomplete = vec![b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10}}}\n\n".as_slice()];
+        assert_eq!(
+            dropped_outcome("responses", incomplete, true).await,
+            "incomplete"
+        );
+        let messages = vec![b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n".as_slice(), b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".as_slice()];
+        assert_eq!(
+            dropped_outcome("messages", messages, true).await,
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_drop_and_incomplete_terminal_remain_cancelled() {
+        let fragments = vec![
+            b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n".as_slice(),
+            b"data: [DONE]\n".as_slice(),
+        ];
+        assert_eq!(
+            dropped_outcome("chat_completions", fragments, true).await,
+            "cancelled"
+        );
+        // A bare [DONE] before any valid chat chunk cannot be trusted as success.
+        let fragments = vec![
+            b"data: [DONE]\n\n".as_slice(),
+            b"data: {\"usage\":{\"prompt_tokens\":10}}\n\n".as_slice(),
+        ];
+        assert_eq!(
+            dropped_outcome("chat_completions", fragments, true).await,
+            "cancelled"
+        );
+        // A terminal name without the required response object is not completion.
+        let fragments = vec![b"data: {\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":10}}}\n\n".as_slice(), b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n".as_slice()];
+        assert_eq!(
+            dropped_outcome("responses", fragments, true).await,
+            "cancelled"
+        );
+        let fragments = vec![b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n".as_slice(), b"event: message_stop\ndata: {}\n\n".as_slice()];
+        assert_eq!(
+            dropped_outcome("messages", fragments, true).await,
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_take_precedence_over_terminal_and_drop() {
+        let fragments = vec![b"data: {\"usage\":{\"prompt_tokens\":10}}\n\nevent: error\ndata: {\"type\":\"error\"}\n\ndata: [DONE]\n\n".as_slice()];
+        assert_eq!(
+            dropped_outcome("chat_completions", fragments, true).await,
+            "error"
+        );
+        let fragments =
+            vec![b"data: {\"usage\":{\"prompt_tokens\":10}}\n\ndata: [DONE]\n\n".as_slice()];
+        assert_eq!(
+            dropped_outcome("chat_completions", fragments, false).await,
+            "error"
+        );
+        let fragments = vec![b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"usage\":{\"input_tokens\":10}}}\n\n".as_slice()];
+        assert_eq!(dropped_outcome("responses", fragments, true).await, "error");
+        let fragments = vec![b"data: {\"usage\":{\"prompt_tokens\":10}}\n\ndata: {\"error\":{\"message\":\"failed\"}}\n\ndata: [DONE]\n\n".as_slice()];
+        assert_eq!(
+            dropped_outcome("chat_completions", fragments, true).await,
+            "error"
+        );
+        let fragments = vec![b"event: response.failed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10}}}\n\n".as_slice()];
+        assert_eq!(dropped_outcome("responses", fragments, true).await, "error");
+        let fragments = vec![b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"failed\",\"usage\":{\"input_tokens\":10}}}\n\n".as_slice()];
+        assert_eq!(dropped_outcome("responses", fragments, true).await, "error");
+    }
+
+    #[tokio::test]
+    async fn eof_parses_json_errors_and_preserves_incomplete_state() {
+        for (endpoint, data, sse, outcome) in [
+            ("chat_completions", b"{\"usage\":{\"prompt_tokens\":4},\"error\":{\"message\":\"fail\"}}".as_slice(), false, "error"),
+            ("chat_completions", b"data: {\"usage\":{\"prompt_tokens\":4}}\n\n".as_slice(), true, "incomplete"),
+            ("responses", b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":4}}}\n\n".as_slice(), true, "incomplete"),
+            ("responses", b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":4}}}\n\n".as_slice(), true, "incomplete"),
+        ] {
+            let store = Arc::new(UsageStore::in_memory().unwrap());
+            let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(data))]);
+            let event = UsageEvent { endpoint: endpoint.into(), model: "mock".into(), ..UsageEvent::default() };
+            let mut observed = UsageStream::new(source, store.clone(), event, sse, Instant::now(), true);
+            observed.next().await.unwrap().unwrap();
+            assert!(observed.next().await.is_none());
+            let events = store.events("lifetime", 1, 10).unwrap();
+            assert_eq!(events["items"][0]["request_outcome"], outcome);
         }
     }
 }

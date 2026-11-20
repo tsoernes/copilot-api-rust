@@ -15,6 +15,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use bytes::Bytes;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -113,6 +114,7 @@ fn build_router(state: AppState) -> Router {
         .route("/token-usage/daily", get(token_daily))
         .route("/token-usage/events", get(token_events))
         .route("/token-usage/sessions", get(token_sessions))
+        .route("/token-usage/rates", get(token_rates))
         .route("/models", get(proxy))
         .route("/v1/models", get(proxy))
         .route("/chat/completions", post(proxy))
@@ -215,7 +217,7 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
     })
 }
 
-fn anthropic_beta(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+fn anthropic_beta(headers: &HeaderMap, payload: &Value) -> Option<String> {
     const ALLOWED: &[&str] = &[
         "interleaved-thinking-2025-05-14",
         "context-management-2025-06-27",
@@ -234,7 +236,6 @@ fn anthropic_beta(headers: &HeaderMap, body: &[u8]) -> Option<String> {
             .collect();
         return (!allowed.is_empty()).then(|| allowed.join(","));
     }
-    let payload: Value = serde_json::from_slice(body).ok()?;
     let thinking = payload.get("thinking")?;
     if thinking.get("type").and_then(Value::as_str) != Some("adaptive")
         && thinking
@@ -333,6 +334,7 @@ enum UsageQuery {
     Daily,
     Events,
     Sessions,
+    Rates,
 }
 
 async fn query_usage(
@@ -365,11 +367,20 @@ async fn query_usage(
         .filter(|v| *v > 0)
         .unwrap_or(20)
         .min(100);
+    let session_id = query.get("session_id").cloned();
+    if matches!(kind, UsageQuery::Rates)
+        && session_id
+            .as_ref()
+            .is_some_and(|id| id.len() > 1024 || id.chars().any(char::is_control))
+    {
+        return error(StatusCode::BAD_REQUEST, "Invalid session identifier");
+    }
     let result = tokio::task::spawn_blocking(move || match kind {
         UsageQuery::Summary => usage.summary(&period),
         UsageQuery::Daily => usage.daily(&period),
         UsageQuery::Events => usage.events(&period, page, page_size),
         UsageQuery::Sessions => usage.sessions(&period, page, page_size),
+        UsageQuery::Rates => usage.rates(session_id.as_deref()),
     })
     .await;
     match result {
@@ -406,6 +417,13 @@ async fn token_sessions(
 ) -> Response {
     query_usage(s, h, q, UsageQuery::Sessions).await
 }
+async fn token_rates(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    query_usage(s, h, q, UsageQuery::Rates).await
+}
 
 fn upstream_path(path: &str) -> &str {
     match path {
@@ -430,12 +448,49 @@ fn contains_image(v: &Value) -> bool {
     }
 }
 
-fn prepare_payload(path: &str, body: &[u8]) -> Result<(Vec<u8>, bool, &'static str), ()> {
-    let mut value: Value = serde_json::from_slice(body).map_err(|_| ())?;
+struct PreparedPayload {
+    body: Bytes,
+    vision: bool,
+    initiator: &'static str,
+    model: String,
+    anthropic_beta: Option<String>,
+}
+
+impl PreparedPayload {
+    fn empty() -> Self {
+        Self {
+            body: Bytes::new(),
+            vision: false,
+            initiator: "user",
+            model: "unknown".into(),
+            anthropic_beta: None,
+        }
+    }
+}
+
+fn prepare_payload(path: &str, body: Bytes, headers: &HeaderMap) -> Result<PreparedPayload, ()> {
+    let parsed = serde_json::from_slice::<Value>(&body).map_err(|_| ());
+    // The parsed Value owns its strings. Drop our reference to the original
+    // input before allocating the canonical serialized body; other Bytes
+    // owners, if any, may still keep the input allocation alive.
+    drop(body);
+    let mut value = parsed?;
     if !value.is_object() {
         return Err(());
     }
     let vision = contains_image(&value);
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .chars()
+        .take(256)
+        .collect();
+    let beta = if path == "/v1/messages" {
+        anthropic_beta(headers, &value)
+    } else {
+        None
+    };
     let last = value
         .get("messages")
         .and_then(Value::as_array)
@@ -475,11 +530,14 @@ fn prepare_payload(path: &str, body: &[u8]) -> Result<(Vec<u8>, bool, &'static s
             object.insert("max_output_tokens".into(), json!(16));
         }
     }
-    Ok((
-        serde_json::to_vec(&value).map_err(|_| ())?,
+    let body = Bytes::from(serde_json::to_vec(&value).map_err(|_| ())?);
+    Ok(PreparedPayload {
+        body,
         vision,
         initiator,
-    ))
+        model,
+        anthropic_beta: beta,
+    })
 }
 
 async fn proxy(State(state): State<AppState>, request: Request) -> Response {
@@ -489,7 +547,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     let path = upstream_path(request.uri().path()).to_owned();
     let method = request.method().clone();
     let headers = request.headers().clone();
-    let (body, vision, initiator) = if method == Method::POST {
+    let prepared = if method == Method::POST {
         if !is_json_content_type(&headers) {
             return error(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -505,13 +563,20 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                 );
             }
         };
-        match prepare_payload(&path, &bytes) {
+        match prepare_payload(&path, bytes, &headers) {
             Ok(v) => v,
             Err(_) => return error(StatusCode::BAD_REQUEST, "Expected a JSON object"),
         }
     } else {
-        (Vec::new(), false, "user")
+        PreparedPayload::empty()
     };
+    let PreparedPayload {
+        body,
+        vision,
+        initiator,
+        model,
+        anthropic_beta,
+    } = prepared;
     let credential = match state.credential().await {
         Ok(c) => c,
         Err(_) => {
@@ -533,21 +598,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         _ => None,
     };
     let event = endpoint.map(|endpoint| {
-        let payload = serde_json::from_slice::<Value>(&body).ok();
-        let model = payload
-            .as_ref()
-            .and_then(|v| v.get("model"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .chars()
-            .take(256)
-            .collect();
-        let session_id = headers
-            .get("x-session-affinity")
-            .or_else(|| headers.get("x-session-id"))
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.chars().take(256).collect())
-            .unwrap_or_else(|| id.clone());
+        let session_id = crate::session_id::resolve(&headers, &id);
         let user_agent = headers
             .get(header::USER_AGENT)
             .and_then(|h| h.to_str().ok())
@@ -592,7 +643,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         if let Some(value) = headers.get("anthropic-version") {
             upstream = upstream.header("anthropic-version", value);
         }
-        if let Some(value) = anthropic_beta(&headers, &body) {
+        if let Some(value) = anthropic_beta {
             upstream = upstream.header("anthropic-beta", value);
         }
     }
@@ -736,24 +787,190 @@ mod tests {
 
     #[test]
     fn response_normalization_and_chat_initiator() {
-        let (body, _, _) = prepare_payload(
+        let prepared = prepare_payload(
             "/responses",
-            br#"{"max_output_tokens":4,"service_tier":"x"}"#,
+            Bytes::from_static(br#"{"max_output_tokens":4,"service_tier":"x"}"#),
+            &HeaderMap::new(),
         )
         .unwrap();
-        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let parsed: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(parsed["max_output_tokens"], 16);
         assert!(parsed.get("service_tier").is_none());
-        let (_, image, initiator) = prepare_payload(
+        let prepared = prepare_payload(
             "/chat/completions",
-            br#"{"messages":[{"role":"tool","content":[{"type":"image_url"}]}]}"#,
+            Bytes::from_static(
+                br#"{"messages":[{"role":"tool","content":[{"type":"image_url"}]}]}"#,
+            ),
+            &HeaderMap::new(),
         )
         .unwrap();
-        assert!(image);
-        assert_eq!(initiator, "agent");
-        assert!(prepare_payload("/responses", b"[]").is_err());
-        assert!(prepare_payload("/responses", b"not json").is_err());
+        assert!(prepared.vision);
+        assert_eq!(prepared.initiator, "agent");
+        assert!(
+            prepare_payload("/responses", Bytes::from_static(b"[]"), &HeaderMap::new()).is_err()
+        );
+        assert!(
+            prepare_payload(
+                "/responses",
+                Bytes::from_static(b"not json"),
+                &HeaderMap::new()
+            )
+            .is_err()
+        );
         assert_eq!(upstream_path("/v1/responses"), "/responses");
+    }
+
+    #[test]
+    fn canonical_request_bytes_and_metadata_match_previous_behavior() {
+        // Legacy behavior parsed into serde_json::Value then serialized it for
+        // every route. Duplicate keys, escaping and numeric representations
+        // must continue to follow that same canonicalization.
+        for path in [
+            "/chat/completions",
+            "/embeddings",
+            "/v1/messages",
+            "/responses",
+        ] {
+            let raw = br#" { "model":"old", "z":1e1, "model":"m\u00f8del", "messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"image"}]}]}], "thinking":{"type":"enabled","budget_tokens":1024}, "service_tier":"priority", "max_output_tokens":4, "z":2.50 } "#;
+            let headers = HeaderMap::new();
+            let prepared = prepare_payload(path, Bytes::from_static(raw), &headers).unwrap();
+            let mut reference: Value = serde_json::from_slice(raw).unwrap();
+            if path == "/responses" {
+                reference.as_object_mut().unwrap().remove("service_tier");
+                reference["max_output_tokens"] = json!(16);
+            }
+            assert_eq!(
+                prepared.body.as_ref(),
+                serde_json::to_vec(&reference).unwrap(),
+                "{path}"
+            );
+            assert_eq!(prepared.model, "mødel");
+            assert!(prepared.vision);
+            assert_eq!(
+                prepared.initiator,
+                if path == "/v1/messages" {
+                    "agent"
+                } else {
+                    "user"
+                }
+            );
+            assert_eq!(
+                prepared.anthropic_beta.as_deref(),
+                if path == "/v1/messages" {
+                    Some("interleaved-thinking-2025-05-14")
+                } else {
+                    None
+                }
+            );
+        }
+        let model = "ø".repeat(260);
+        let body = Bytes::from(serde_json::to_vec(&json!({"model":model})).unwrap());
+        let prepared = prepare_payload("/chat/completions", body, &HeaderMap::new()).unwrap();
+        assert_eq!(prepared.model.chars().count(), 256);
+        assert_eq!(
+            prepare_payload(
+                "/embeddings",
+                Bytes::from_static(b"null"),
+                &HeaderMap::new()
+            )
+            .err(),
+            Some(())
+        );
+        assert_eq!(
+            prepare_payload(
+                "/embeddings",
+                Bytes::from_static(b"{bad"),
+                &HeaderMap::new()
+            )
+            .err(),
+            Some(())
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_limit_and_canonicalized_forwarding_are_preserved() {
+        use futures_util::stream;
+        use tokio::sync::mpsc;
+        use tower::ServiceExt;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let upstream = Router::new().route(
+            "/chat/completions",
+            post(move |request: Request| {
+                let tx = tx.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let body = to_bytes(body, MAX_REQUEST_BYTES).await.unwrap();
+                    tx.send((parts.headers, body)).unwrap();
+                    (StatusCode::ACCEPTED, "ok")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let app =
+            router_with_test_credential(format!("http://{addr}"), "copilot-test".into(), None)
+                .unwrap();
+        let parts = vec![
+            Bytes::from_static(b"{\"model\":\"old\",\"model\":"),
+            Bytes::from_static(b"\"new\",\"n\":1e1}"),
+        ];
+        let body = Body::from_stream(stream::iter(
+            parts.into_iter().map(Ok::<Bytes, std::io::Error>),
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let (_, forwarded) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let reference: Value =
+            serde_json::from_slice(br#"{"model":"old","model":"new","n":1e1}"#).unwrap();
+        assert_eq!(forwarded.as_ref(), serde_json::to_vec(&reference).unwrap());
+        // Exactly 16 MiB, including valid trailing JSON whitespace, must be
+        // accepted; the upstream still receives the canonical compact object.
+        let mut exact = b"{\"model\":\"boundary\"}".to_vec();
+        exact.resize(MAX_REQUEST_BYTES, b' ');
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(Bytes::from(exact)))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+        let (_, forwarded) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forwarded.as_ref(), br#"{"model":"boundary"}"#);
+        let oversized = Body::from_stream(stream::iter([
+            Ok::<Bytes, std::io::Error>(Bytes::from(vec![b' '; MAX_REQUEST_BYTES])),
+            Ok(Bytes::from_static(b" ")),
+        ]));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(oversized)
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(rx.try_recv().is_err());
+        server.abort();
     }
 
     #[test]
@@ -796,9 +1013,9 @@ mod tests {
     #[test]
     fn only_supported_anthropic_betas_are_forwarded() {
         let mut headers = HeaderMap::new();
-        let thinking = br#"{"thinking":{"type":"enabled","budget_tokens":1024}}"#;
+        let thinking = json!({"thinking":{"type":"enabled","budget_tokens":1024}});
         assert_eq!(
-            anthropic_beta(&headers, thinking).as_deref(),
+            anthropic_beta(&headers, &thinking).as_deref(),
             Some("interleaved-thinking-2025-05-14")
         );
         headers.insert(
@@ -808,16 +1025,16 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            anthropic_beta(&headers, thinking).as_deref(),
+            anthropic_beta(&headers, &thinking).as_deref(),
             Some("extended-cache-ttl-2025-04-11")
         );
         headers.insert("anthropic-beta", "bad".parse().unwrap());
-        assert_eq!(anthropic_beta(&headers, thinking), None);
+        assert_eq!(anthropic_beta(&headers, &thinking), None);
         headers.clear();
         assert_eq!(
             anthropic_beta(
                 &headers,
-                br#"{"thinking":{"type":"adaptive","budget_tokens":1024}}"#
+                &json!({"thinking":{"type":"adaptive","budget_tokens":1024}})
             ),
             None
         );

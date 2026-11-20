@@ -124,10 +124,20 @@ struct App {
     page: usize,
     model_offset: usize,
     event_offset: usize,
+    session_page: usize,
+    session_offset: usize,
+    show_event_detail: bool,
+    detail_scroll: usize,
+    selected_event_id: Option<i64>,
+    confirm_billing: bool,
+    notice: Option<String>,
     paused: bool,
     summary: Option<Value>,
     daily: Option<Value>,
     events: Option<Value>,
+    sessions: Option<Value>,
+    rates: Option<Value>,
+    session_rates: Option<Value>,
     quota: Option<Value>,
     usage_updated: Option<Instant>,
     quota_updated: Option<Instant>,
@@ -142,24 +152,50 @@ impl App {
         self.summary = None;
         self.daily = None;
         self.events = None;
+        self.sessions = None;
+        self.session_rates = None;
         self.usage_updated = None;
     }
     fn apply_usage(&mut self, snapshot: UsageSnapshot) {
         let mut failures = Vec::new();
+        let selected_session = self.selected_session();
         for (name, result, destination) in [
             ("summary", snapshot.summary, &mut self.summary),
             ("daily", snapshot.daily, &mut self.daily),
             ("events", snapshot.events, &mut self.events),
+            ("sessions", snapshot.sessions, &mut self.sessions),
+            ("rates", snapshot.rates, &mut self.rates),
         ] {
             match result {
                 Ok(value) => *destination = Some(value),
                 Err(error) => failures.push(format!("{name}: {error}")),
             }
         }
-        // Sessions are fetched for consistency with the viewer, but do not hide
-        // otherwise useful overview data if the endpoint is unavailable.
-        if let Err(error) = snapshot.sessions {
-            failures.push(format!("sessions: {error}"));
+        if let Some(result) = snapshot.session_rates {
+            match result {
+                Ok(value) => self.session_rates = Some(value),
+                Err(error) => {
+                    self.session_rates = None;
+                    failures.push(format!("session rates: {error}"));
+                }
+            }
+        } else {
+            self.session_rates = None;
+        }
+        if let Some(sessions) = self
+            .sessions
+            .as_ref()
+            .and_then(|v| v.get("items"))
+            .and_then(Value::as_array)
+        {
+            if let Some(id) = selected_session
+                && let Some(index) = sessions.iter().position(|session| {
+                    session.get("session_id").and_then(Value::as_str) == Some(id.as_str())
+                })
+            {
+                self.session_offset = index;
+            }
+            self.session_offset = self.session_offset.min(sessions.len().saturating_sub(1));
         }
         if let Some(models) = self
             .summary
@@ -175,6 +211,20 @@ impl App {
             .and_then(|v| v.get("items"))
             .and_then(Value::as_array)
         {
+            if self.show_event_detail
+                && let Some(id) = self.selected_event_id
+            {
+                if let Some(index) = events
+                    .iter()
+                    .position(|event| event.get("id").and_then(Value::as_i64) == Some(id))
+                {
+                    self.event_offset = index;
+                } else {
+                    self.show_event_detail = false;
+                    self.detail_scroll = 0;
+                    self.selected_event_id = None;
+                }
+            }
             self.event_offset = self.event_offset.min(events.len().saturating_sub(1));
         }
         if failures.is_empty() {
@@ -183,6 +233,16 @@ impl App {
         } else {
             self.usage_error = Some(format!("STALE / unavailable: {}", failures.join("; ")));
         }
+    }
+    fn selected_session(&self) -> Option<String> {
+        self.sessions
+            .as_ref()
+            .and_then(|v| v.get("items"))
+            .and_then(Value::as_array)
+            .and_then(|items| items.get(self.session_offset))
+            .and_then(|v| v.get("session_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
     }
     fn apply_quota(&mut self, result: std::result::Result<Value, String>) {
         match result {
@@ -194,12 +254,38 @@ impl App {
             Err(error) => self.quota_error = Some(format!("Quota stale / unavailable: {error}")),
         }
     }
+    fn key_in_terminal(&mut self, key: KeyEvent, width: u16, height: u16) -> Action {
+        // Never allow an unseen billing confirmation to open a browser.
+        if width < 42 || height < 10 {
+            if self.confirm_billing {
+                self.confirm_billing = false;
+            }
+            if key.code == KeyCode::Char('b') {
+                return Action::None;
+            }
+        }
+        self.key(key)
+    }
     fn key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
+        }
+        if self.confirm_billing {
+            return match key.code {
+                KeyCode::Char('y' | 'Y') => {
+                    self.confirm_billing = false;
+                    Action::OpenBilling
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    self.confirm_billing = false;
+                    Action::None
+                }
+                KeyCode::Char('q') => Action::Quit,
+                _ => Action::None,
+            };
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
@@ -219,12 +305,16 @@ impl App {
                 self.tab = 3;
                 Action::None
             }
+            KeyCode::Char('5') => {
+                self.tab = 4;
+                Action::None
+            }
             KeyCode::Tab => {
-                self.tab = (self.tab + 1) % 4;
+                self.tab = (self.tab + 1) % 5;
                 Action::None
             }
             KeyCode::BackTab => {
-                self.tab = (self.tab + 3) % 4;
+                self.tab = (self.tab + 4) % 5;
                 Action::None
             }
             KeyCode::Char('p') => {
@@ -232,10 +322,36 @@ impl App {
                 self.page = 1;
                 self.model_offset = 0;
                 self.event_offset = 0;
+                self.session_page = 1;
+                self.session_offset = 0;
+                self.show_event_detail = false;
+                self.detail_scroll = 0;
+                self.selected_event_id = None;
                 self.clear_usage();
                 Action::Usage
             }
             KeyCode::Char('r') => Action::Both,
+            KeyCode::Char('b') if self.tab == 1 => {
+                self.confirm_billing = true;
+                Action::None
+            }
+            KeyCode::Char('d') if self.tab == 3 => {
+                if self.show_event_detail {
+                    self.show_event_detail = false;
+                    self.selected_event_id = None;
+                } else if let Some(event) = self
+                    .events
+                    .as_ref()
+                    .and_then(|v| v.get("items"))
+                    .and_then(Value::as_array)
+                    .and_then(|events| events.get(self.event_offset))
+                {
+                    self.show_event_detail = true;
+                    self.selected_event_id = event.get("id").and_then(Value::as_i64);
+                }
+                self.detail_scroll = 0;
+                Action::None
+            }
             KeyCode::Char(' ') => {
                 self.paused = !self.paused;
                 if self.paused {
@@ -246,6 +362,44 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') if self.tab == 2 => {
                 self.model_offset = self.model_offset.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.tab == 4 && self.session_offset > 0 => {
+                self.session_offset -= 1;
+                self.session_rates = None;
+                Action::Usage
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.tab == 4 => {
+                let count = self
+                    .sessions
+                    .as_ref()
+                    .and_then(|v| v.get("items"))
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                if self.session_offset + 1 < count {
+                    self.session_offset += 1;
+                    self.session_rates = None;
+                    Action::Usage
+                } else {
+                    Action::None
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.tab == 3 && self.show_event_detail => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.tab == 3 && self.show_event_detail => {
+                if let Some(event) = self
+                    .events
+                    .as_ref()
+                    .and_then(|v| v.get("items"))
+                    .and_then(Value::as_array)
+                    .and_then(|events| events.get(self.event_offset))
+                {
+                    let maximum = ui::event_detail_line_count(event).saturating_sub(1);
+                    self.detail_scroll = self.detail_scroll.saturating_add(1).min(maximum);
+                }
                 Action::None
             }
             KeyCode::Up | KeyCode::Char('k') if self.tab == 3 => {
@@ -281,6 +435,9 @@ impl App {
             KeyCode::Left if self.tab == 3 && self.page > 1 => {
                 self.page -= 1;
                 self.event_offset = 0;
+                self.show_event_detail = false;
+                self.detail_scroll = 0;
+                self.selected_event_id = None;
                 self.events = None;
                 Action::Usage
             }
@@ -294,7 +451,34 @@ impl App {
                 if (self.page as u64) < pages {
                     self.page += 1;
                     self.event_offset = 0;
+                    self.show_event_detail = false;
+                    self.detail_scroll = 0;
+                    self.selected_event_id = None;
                     self.events = None;
+                    Action::Usage
+                } else {
+                    Action::None
+                }
+            }
+            KeyCode::Left if self.tab == 4 && self.session_page > 1 => {
+                self.session_page -= 1;
+                self.session_offset = 0;
+                self.sessions = None;
+                self.session_rates = None;
+                Action::Usage
+            }
+            KeyCode::Right if self.tab == 4 => {
+                let pages = self
+                    .sessions
+                    .as_ref()
+                    .and_then(|v| v.get("total_pages"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                if (self.session_page as u64) < pages {
+                    self.session_page += 1;
+                    self.session_offset = 0;
+                    self.sessions = None;
+                    self.session_rates = None;
                     Action::Usage
                 } else {
                     Action::None
@@ -310,12 +494,15 @@ enum Action {
     Quit,
     Usage,
     Both,
+    OpenBilling,
 }
 enum Update {
     Usage {
         period: usize,
         page: usize,
-        result: UsageSnapshot,
+        session_page: usize,
+        selected_session: Option<String>,
+        result: Box<UsageSnapshot>,
     },
     Quota(std::result::Result<Value, String>),
 }
@@ -330,13 +517,25 @@ fn launch_usage(
     let tx = tx.clone();
     let period = app.period;
     let page = app.page;
+    let session_page = app.session_page;
+    let selected_session = app.selected_session();
     tasks.spawn(async move {
-        let result = client.fetch_usage(PERIODS[period], page, PAGE_SIZE).await;
+        let result = client
+            .fetch_usage(
+                PERIODS[period],
+                page,
+                session_page,
+                PAGE_SIZE,
+                selected_session.as_deref(),
+            )
+            .await;
         let _ = tx
             .send(Update::Usage {
                 period,
                 page,
-                result,
+                session_page,
+                selected_session,
+                result: Box::new(result),
             })
             .await;
     });
@@ -361,6 +560,7 @@ pub async fn run(
     let mut screen = Screen::enter()?;
     let mut app = App {
         page: 1,
+        session_page: 1,
         ..App::default()
     };
     let mut input = EventStream::new();
@@ -392,7 +592,10 @@ pub async fn run(
             .quota_updated
             .map(|t| format!("{}s ago", t.elapsed().as_secs()))
             .unwrap_or_else(|| "not loaded".into());
-        let status = format!("server running · quota {quota_age}");
+        let status = app
+            .notice
+            .clone()
+            .unwrap_or_else(|| format!("server running · quota {quota_age}"));
         let error = app
             .usage_error
             .clone()
@@ -408,11 +611,19 @@ pub async fn run(
                     summary: app.summary.as_ref(),
                     daily: app.daily.as_ref(),
                     events: app.events.as_ref(),
+                    sessions: app.sessions.as_ref(),
+                    rates: app.rates.as_ref(),
+                    session_rates: app.session_rates.as_ref(),
                     quota: app.quota.as_ref(),
                     status: &status,
                     page: app.page,
                     model_offset: app.model_offset,
                     event_offset: app.event_offset,
+                    session_page: app.session_page,
+                    session_offset: app.session_offset,
+                    show_event_detail: app.show_event_detail,
+                    detail_scroll: app.detail_scroll,
+                    confirm_billing: app.confirm_billing,
                     paused: app.paused,
                     last_updated: &age,
                     error: error.as_deref(),
@@ -421,8 +632,18 @@ pub async fn run(
         })?;
         tokio::select! {
             event = input.next() => {
-                let action = match event { Some(Ok(Event::Key(key))) => app.key(key), Some(Ok(_)) => Action::None, Some(Err(error)) => return Err(error).context("reading terminal input"), None => break };
+                let action = match event { Some(Ok(Event::Key(key))) => { let size = screen.terminal.size()?; app.key_in_terminal(key, size.width, size.height) }, Some(Ok(Event::Resize(width, height))) => { if width < 42 || height < 10 { app.confirm_billing = false; } Action::None }, Some(Ok(_)) => Action::None, Some(Err(error)) => return Err(error).context("reading terminal input"), None => break };
                 if action == Action::Quit { break; }
+                if action == Action::OpenBilling {
+                    match std::process::Command::new("xdg-open").arg("https://github.com/settings/copilot/features")
+                        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() {
+                        Ok(mut child) => {
+                            std::thread::spawn(move || { let _ = child.wait(); });
+                            app.notice = Some("Requested browser: github.com/settings/copilot/features (change payer there)".into());
+                        }
+                        Err(_) => app.notice = Some("Browser unavailable; visit github.com/settings/copilot/features".into()),
+                    }
+                }
                 if matches!(action, Action::Usage | Action::Both) {
                     if usage_pending { usage_requeue = true; } else { launch_usage(&client, &app, &tx, &mut tasks); usage_pending = true; }
                 }
@@ -433,9 +654,12 @@ pub async fn run(
             _ = usage_interval.tick() => if !app.paused && !usage_pending { launch_usage(&client, &app, &tx, &mut tasks); usage_pending = true; },
             _ = quota_interval.tick() => if !app.paused && !quota_pending { launch_quota(&client, &tx, &mut tasks); quota_pending = true; },
             Some(update) = rx.recv() => match update {
-                Update::Usage { period, page, result } => {
+                Update::Usage { period, page, session_page, selected_session, result } => {
                     usage_pending = false;
-                    if period == app.period && page == app.page { app.apply_usage(result); }
+                    if period == app.period && page == app.page && session_page == app.session_page {
+                        app.apply_usage(*result);
+                        if app.selected_session().is_some() && app.selected_session() != selected_session { usage_requeue = true; }
+                    }
                     if usage_requeue { usage_requeue = false; launch_usage(&client, &app, &tx, &mut tasks); usage_pending = true; }
                 },
                 Update::Quota(result) => {
@@ -504,9 +728,68 @@ mod tests {
             daily: Ok(serde_json::json!({})),
             events: Ok(serde_json::json!({})),
             sessions: Ok(serde_json::json!({})),
+            rates: Ok(serde_json::json!({})),
+            session_rates: None,
         });
         assert!(app.usage_error.as_deref().unwrap().contains("STALE"));
         assert!(app.summary.is_some());
+    }
+
+    #[test]
+    fn billing_settings_require_visible_explicit_confirmation() {
+        let mut app = App {
+            page: 1,
+            tab: 1,
+            ..App::default()
+        };
+        assert!(
+            app.key_in_terminal(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+                41,
+                10
+            ) == Action::None
+        );
+        assert!(!app.confirm_billing);
+        app.key_in_terminal(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            42,
+            10,
+        );
+        assert!(app.confirm_billing);
+        assert!(
+            app.key_in_terminal(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                41,
+                10
+            ) == Action::None
+        );
+        assert!(!app.confirm_billing);
+        app.key_in_terminal(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            80,
+            24,
+        );
+        assert!(
+            app.key_in_terminal(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+                80,
+                24
+            ) == Action::None
+        );
+        assert!(!app.confirm_billing);
+        app.key_in_terminal(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            80,
+            24,
+        );
+        assert!(
+            app.key_in_terminal(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                80,
+                24
+            ) == Action::OpenBilling
+        );
+        assert!(!app.confirm_billing);
     }
 
     #[test]
@@ -550,9 +833,73 @@ mod tests {
             daily: Ok(serde_json::json!({})),
             events: Ok(serde_json::json!({"items":[]})),
             sessions: Ok(serde_json::json!({})),
+            rates: Ok(serde_json::json!({})),
+            session_rates: None,
         });
         assert!(app.usage_updated.is_some());
         assert!(app.usage_error.is_none());
+    }
+
+    #[test]
+    fn request_details_keep_selection_across_reordered_refreshes() {
+        let mut app = App {
+            page: 1,
+            tab: 3,
+            events: Some(
+                serde_json::json!({"items":[{"id":11,"model":"a"},{"id":12,"model":"b"}]}),
+            ),
+            ..App::default()
+        };
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(app.show_event_detail);
+        assert_eq!(app.selected_event_id, Some(12));
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.detail_scroll, 1);
+        let refreshed = UsageSnapshot {
+            summary: Ok(serde_json::json!({})),
+            daily: Ok(serde_json::json!({})),
+            events: Ok(serde_json::json!({"items":[{"id":99},{"id":11},{"id":12}]})),
+            sessions: Ok(serde_json::json!({})),
+            rates: Ok(serde_json::json!({})),
+            session_rates: None,
+        };
+        app.apply_usage(refreshed);
+        assert_eq!(app.event_offset, 2);
+        assert!(app.show_event_detail);
+        app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(!app.show_event_detail);
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn session_navigation_is_independent_and_preserves_selection() {
+        let mut app = App {
+            page: 2,
+            session_page: 1,
+            tab: 4,
+            sessions: Some(
+                serde_json::json!({"total_pages":2,"items":[{"session_id":"a"},{"session_id":"b"}]}),
+            ),
+            ..App::default()
+        };
+        assert!(app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)) == Action::Usage);
+        assert_eq!(app.selected_session().as_deref(), Some("b"));
+        app.apply_usage(UsageSnapshot {
+            summary: Ok(serde_json::json!({})), daily: Ok(serde_json::json!({})),
+            events: Ok(serde_json::json!({})),
+            sessions: Ok(serde_json::json!({"total_pages":2,"items":[{"session_id":"b"},{"session_id":"a"}]})),
+            rates: Ok(serde_json::json!({"windows":[]})), session_rates: Some(Ok(serde_json::json!({"session_id":"a","windows":[]}))),
+        });
+        assert_eq!(app.selected_session().as_deref(), Some("b"));
+        assert_eq!(app.session_offset, 0);
+        assert!(app.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)) == Action::Usage);
+        assert_eq!(app.session_page, 2);
+        assert_eq!(app.page, 2);
+        assert!(app.session_rates.is_none());
+        app.key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.tab, 0);
     }
 
     #[tokio::test]
@@ -584,6 +931,7 @@ mod tests {
                     period,
                     page,
                     result,
+                    ..
                 } => {
                     assert_eq!((period, page), (2, 2));
                     assert!(result.summary.is_ok());

@@ -247,3 +247,133 @@ async fn truncated_upstream_stream_records_error_outcome() {
     .unwrap();
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn real_http_client_closing_after_terminal_preserves_outcome_details_and_session() {
+    let upstream = Router::new().route("/responses", post(|| async {
+        let terminal = Bytes::from_static(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens_details\":{\"reasoning_tokens\":3}}}}\n\n");
+        let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(terminal) }).chain(stream::pending());
+        ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(stream))
+    }));
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_task =
+        tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+    let usage = Arc::new(UsageStore::in_memory().unwrap());
+    let gateway =
+        router_with_test_usage(format!("http://{upstream_addr}"), None, usage.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, gateway).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("http://{addr}/v1/responses"))
+            .header("session-id", "fake-codex-session")
+            .json(&serde_json::json!({"model":"fake-model", "input":"hello", "stream":true}))
+            .send()
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\n\n") {
+            bytes.extend_from_slice(&body.next().await.unwrap().unwrap());
+        }
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("response.completed")
+        );
+        drop(body); // Real network client stops after the SSE terminal, before HTTP EOF.
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let events = usage.events("lifetime", 1, 20).unwrap();
+            if events["total"] == 2 {
+                for event in events["items"].as_array().unwrap() {
+                    assert_eq!(event["request_outcome"], "completed");
+                    assert_eq!(event["session_id"], "fake-codex-session");
+                    assert_eq!(
+                        event["token_details"]["output_tokens_details.reasoning_tokens"],
+                        3
+                    );
+                    assert_eq!(event["input_tokens"], 8);
+                    assert_eq!(event["cache_read_input_tokens"], 2);
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let sessions = usage.sessions("lifetime", 1, 20).unwrap();
+    assert_eq!(sessions["total"], 1);
+    assert_eq!(sessions["items"][0]["request_count"], 2);
+    let rates = usage.rates(Some("fake-codex-session")).unwrap();
+    assert_eq!(rates["windows"][0]["totals"]["request_count"], 2);
+    assert_eq!(rates["windows"][0]["totals"]["total_tokens"], 30);
+    let no_key = client
+        .get(format!(
+            "http://{addr}/token-usage/rates?session_id=fake-codex-session"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_key.status(), StatusCode::OK);
+    let api: serde_json::Value = no_key.json().await.unwrap();
+    assert_eq!(api["windows"][0]["totals"]["request_count"], 2);
+    server.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn rolling_rate_endpoint_requires_key_and_filters_sessions() {
+    let usage = Arc::new(UsageStore::in_memory().unwrap());
+    for (session, tokens) in [("one", 10), ("two", 20)] {
+        usage
+            .record(crate::usage::UsageEvent {
+                model: "fake".into(),
+                endpoint: "responses".into(),
+                session_id: session.into(),
+                input_tokens: tokens,
+                total_tokens: tokens,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let app =
+        router_with_test_usage("http://127.0.0.1:1".into(), Some("key".into()), usage).unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(get_request("/token-usage/rates", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/token-usage/rates?session_id=one",
+            Some("key"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let data: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(data["session_id"], "one");
+    assert_eq!(data["windows"][0]["totals"]["request_count"], 1);
+    assert_eq!(data["windows"][0]["totals"]["total_tokens"], 10);
+    let global = app
+        .oneshot(get_request("/token-usage/rates", Some("key")))
+        .await
+        .unwrap();
+    let data: serde_json::Value =
+        serde_json::from_slice(&to_bytes(global.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(data["session_id"], serde_json::Value::Null);
+    assert_eq!(data["windows"][0]["totals"]["request_count"], 2);
+    assert_eq!(data["windows"][0]["totals"]["total_tokens"], 30);
+}

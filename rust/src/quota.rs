@@ -96,6 +96,7 @@ struct Usage {
     copilot_plan: Option<String>,
     quota_reset_date: Option<String>,
     quota_snapshots: Option<Snapshots>,
+    token_based_billing: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -156,6 +157,14 @@ pub fn normalize_copilot_usage(value: Value) -> Result<Value> {
         if let Some(limit) = limit {
             object.insert("limit".into(), json!(limit));
         }
+        // Preserve the actual reported values instead of reconstructing a
+        // balance from rounded percentages or clamped consumption.
+        if let Some(remaining) = remaining {
+            object.insert("remaining".into(), json!(remaining));
+        }
+        if let Some(quota_remaining) = quota.quota_remaining {
+            object.insert("reportedQuotaRemaining".into(), json!(quota_remaining));
+        }
         if let Some(ref reset) = usage.quota_reset_date {
             object.insert("resetDate".into(), json!(reset));
         }
@@ -166,6 +175,9 @@ pub fn normalize_copilot_usage(value: Value) -> Result<Value> {
         json!({ "provider": "github-copilot", "windows": windows, "limitReached": reached });
     if let Some(plan) = usage.copilot_plan {
         result["planType"] = json!(plan);
+    }
+    if let Some(token_based) = usage.token_based_billing {
+        result["tokenBasedBilling"] = json!(token_based);
     }
     Ok(result)
 }
@@ -232,6 +244,23 @@ mod tests {
         );
         assert!(normalize_copilot_usage(json!({"copilot_plan":7})).is_err());
         assert!(QuotaClient::new("  ".into()).is_err());
+    }
+
+    #[test]
+    fn preserves_separately_reported_balances_and_billing_mode() {
+        let value = normalize_copilot_usage(json!({"token_based_billing":true,"quota_snapshots":{
+            "premium_interactions":{"entitlement":1000,"remaining":600,"quota_remaining":600.25,"percent_remaining":60.0}
+        }})).unwrap();
+        assert_eq!(value["tokenBasedBilling"], true);
+        assert_eq!(value["windows"][0]["remaining"], 600.0);
+        assert_eq!(value["windows"][0]["reportedQuotaRemaining"], 600.25);
+        assert_eq!(value["windows"][0]["used"], 400.0);
+        let only_percent = normalize_copilot_usage(
+            json!({"quota_snapshots":{"premium_interactions":{"percent_remaining":50}}}),
+        )
+        .unwrap();
+        assert!(only_percent["windows"][0].get("remaining").is_none());
+        assert!(only_percent.get("tokenBasedBilling").is_none());
     }
 
     #[derive(Clone)]

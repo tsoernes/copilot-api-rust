@@ -15,6 +15,7 @@ use reqwest::{
 use serde_json::Value;
 
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
+const MAX_SESSION_ID_BYTES: usize = 1024;
 const TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone)]
@@ -31,6 +32,8 @@ pub struct UsageSnapshot {
     pub daily: Result<Value, String>,
     pub events: Result<Value, String>,
     pub sessions: Result<Value, String>,
+    pub rates: Result<Value, String>,
+    pub session_rates: Option<Result<Value, String>>,
 }
 
 impl MonitorClient {
@@ -80,8 +83,15 @@ impl MonitorClient {
         })
     }
 
-    /// Refresh the local aggregates and bounded event/session pages in parallel.
-    pub async fn fetch_usage(&self, period: &str, page: usize, page_size: usize) -> UsageSnapshot {
+    /// Refresh local aggregates, independent event/session pages, and rolling rates.
+    pub async fn fetch_usage(
+        &self,
+        period: &str,
+        event_page: usize,
+        session_page: usize,
+        page_size: usize,
+        selected_session: Option<&str>,
+    ) -> UsageSnapshot {
         if !matches!(
             period,
             "today" | "this_week" | "last_7_days" | "this_month" | "last_30_days" | "lifetime"
@@ -91,28 +101,49 @@ impl MonitorClient {
                 summary: error.clone(),
                 daily: error.clone(),
                 events: error.clone(),
-                sessions: error,
+                sessions: error.clone(),
+                rates: error.clone(),
+                session_rates: selected_session.map(|_| error),
             };
         }
-        let page = page.clamp(1, i32::MAX as usize).to_string();
+        let event_page = event_page.clamp(1, i32::MAX as usize).to_string();
+        let session_page = session_page.clamp(1, i32::MAX as usize).to_string();
         let size = page_size.clamp(1, 100).to_string();
         let period_params = [("period", period)];
-        let page_params = [
+        let event_params = [
             ("period", period),
-            ("page", page.as_str()),
+            ("page", event_page.as_str()),
             ("page_size", size.as_str()),
         ];
-        let (summary, daily, events, sessions) = tokio::join!(
+        let session_params = [
+            ("period", period),
+            ("page", session_page.as_str()),
+            ("page_size", size.as_str()),
+        ];
+        let session_rate = async {
+            match selected_session {
+                None => None,
+                Some(id) if id.len() > MAX_SESSION_ID_BYTES || id.chars().any(char::is_control) => {
+                    Some(Err("Invalid session identifier".into()))
+                }
+                Some(id) => Some(self.fetch("token-usage/rates", &[("session_id", id)]).await),
+            }
+        };
+        let (summary, daily, events, sessions, rates, session_rates) = tokio::join!(
             self.fetch("token-usage", &period_params),
             self.fetch("token-usage/daily", &period_params),
-            self.fetch("token-usage/events", &page_params),
-            self.fetch("token-usage/sessions", &page_params),
+            self.fetch("token-usage/events", &event_params),
+            self.fetch("token-usage/sessions", &session_params),
+            self.fetch("token-usage/rates", &[]),
+            session_rate,
         );
         UsageSnapshot {
             summary,
             daily,
             events,
             sessions,
+            rates,
+            session_rates,
         }
     }
 
@@ -244,6 +275,26 @@ mod tests {
                 assert!(request.uri().query().unwrap().contains("page_size=100"));
                 assert!(request.uri().query().unwrap().contains("page=1"));
             }
+            if path.ends_with("/sessions") {
+                assert!(request.uri().query().unwrap().contains("page_size=100"));
+                assert!(request.uri().query().unwrap().contains("page=7"));
+            }
+            if path.ends_with("/rates") {
+                let url = Url::parse(&format!("http://localhost{}", request.uri())).unwrap();
+                let query: std::collections::HashMap<_, _> =
+                    url.query_pairs().into_owned().collect();
+                let session = query.get("session_id").cloned();
+                if let Some(session) = &session {
+                    assert_eq!(session, "session alpha &?=+ø");
+                    assert_eq!(query.len(), 1);
+                }
+                return Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"path":path,"session_id":session}).to_string(),
+                    ))
+                    .unwrap();
+            }
             Response::builder()
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!("{{\"path\":\"{path}\"}}")))
@@ -252,10 +303,17 @@ mod tests {
         let app = Router::new().fallback(get(handler));
         let (base, task) = spawn(app).await;
         let client = MonitorClient::new(&base, Some("top-secret".into())).unwrap();
-        let result = client.fetch_usage("today", 0, 1000).await;
+        let result = client
+            .fetch_usage("today", 0, 7, 1000, Some("session alpha &?=+ø"))
+            .await;
         assert_eq!(result.summary.unwrap()["path"], "/token-usage");
         assert_eq!(result.events.unwrap()["path"], "/token-usage/events");
         assert_eq!(result.sessions.unwrap()["path"], "/token-usage/sessions");
+        assert_eq!(result.rates.unwrap()["path"], "/token-usage/rates");
+        assert_eq!(
+            result.session_rates.unwrap().unwrap()["session_id"],
+            "session alpha &?=+ø"
+        );
         let error = result.daily.unwrap_err();
         assert_eq!(error, "Server returned HTTP 500");
         assert!(!error.contains("top-secret"));
@@ -263,7 +321,52 @@ mod tests {
             client.fetch_quota().await.unwrap()["path"],
             "/usage/github-copilot"
         );
-        assert!(client.fetch_usage("bad", 1, 20).await.summary.is_err());
+        assert!(
+            client
+                .fetch_usage("bad", 1, 1, 20, None)
+                .await
+                .summary
+                .is_err()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_rate_selection_is_optional_and_invalid_ids_are_not_sent() {
+        async fn handler(State(hits): State<Arc<AtomicUsize>>, request: Request) -> Response {
+            if request.uri().path() == "/token-usage/rates" {
+                hits.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    request.uri().query().is_none(),
+                    "invalid session must not be sent"
+                );
+            }
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        }
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (base, task) = spawn(
+            Router::new()
+                .fallback(get(handler))
+                .with_state(hits.clone()),
+        )
+        .await;
+        let client = MonitorClient::new(&base, None).unwrap();
+        let result = client.fetch_usage("today", 1, 1, 20, None).await;
+        assert!(result.rates.is_ok());
+        assert!(result.session_rates.is_none());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        for invalid in ["s\ntoken".to_owned(), "x".repeat(MAX_SESSION_ID_BYTES + 1)] {
+            let result = client.fetch_usage("today", 1, 1, 20, Some(&invalid)).await;
+            assert!(result.rates.is_ok());
+            assert_eq!(
+                result.session_rates.unwrap().unwrap_err(),
+                "Invalid session identifier"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
         task.abort();
     }
 
@@ -312,7 +415,7 @@ mod tests {
         let (base, task) = spawn(app).await;
         let result = MonitorClient::new(&base, None)
             .unwrap()
-            .fetch_usage("today", 1, 20)
+            .fetch_usage("today", 1, 1, 20, None)
             .await;
         assert_eq!(
             result.summary.unwrap_err(),

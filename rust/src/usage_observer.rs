@@ -1,6 +1,6 @@
 //! Bounded, passive observation of upstream usage.  No response bytes are
 //! changed: callers forward each original chunk after calling `observe`.
-use std::time::Instant;
+use std::{collections::BTreeMap, time::Instant};
 
 use serde_json::Value;
 
@@ -17,6 +17,17 @@ pub struct ObservedUsage {
     pub total_nano_aiu: Option<i64>,
     pub first_token_ms: Option<i64>,
     pub protocol_error: bool,
+    pub terminal: Option<StreamTerminal>,
+    pub monthly_quota_exceeded: bool,
+    /// Optional provider-reported nested token subcounts; may overlap totals.
+    pub token_details: BTreeMap<String, i64>,
+}
+
+/// A protocol terminal event. Incomplete is distinct from success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamTerminal {
+    Completed,
+    Incomplete,
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +52,7 @@ pub struct UsageObserver {
     event_name: Vec<u8>,
     event_oversize: bool,
     last_was_cr: bool,
+    saw_chat_payload: bool,
 }
 
 impl UsageObserver {
@@ -65,6 +77,7 @@ impl UsageObserver {
             event_name: Vec::new(),
             event_oversize: false,
             last_was_cr: false,
+            saw_chat_payload: false,
         }
     }
 
@@ -106,6 +119,24 @@ impl UsageObserver {
 
     pub fn protocol_error(&self) -> bool {
         self.usage.protocol_error
+    }
+
+    /// Return the explicit protocol terminal state, if observed.
+    pub fn terminal(&self) -> Option<StreamTerminal> {
+        self.usage.terminal
+    }
+
+    pub fn monthly_quota_exceeded(&self) -> bool {
+        self.usage.monthly_quota_exceeded
+    }
+
+    /// HTTP EOF alone does not establish generation completion for these protocols.
+    pub fn expects_terminal(&self) -> bool {
+        self.is_sse
+            && matches!(
+                self.protocol,
+                Protocol::Chat | Protocol::Responses | Protocol::Messages
+            )
     }
 
     /// Complete a non-streaming response or return observations from complete
@@ -189,8 +220,14 @@ impl UsageObserver {
             let event_name = std::str::from_utf8(&self.event_name)
                 .ok()
                 .map(str::to_owned);
-            if event_name.as_deref() == Some("error") {
+            if matches!(event_name.as_deref(), Some("error" | "response.failed")) {
                 self.usage.protocol_error = true;
+            }
+            if matches!(self.protocol, Protocol::Chat)
+                && self.saw_chat_payload
+                && std::str::from_utf8(&self.event_data).is_ok_and(|data| data.trim() == "[DONE]")
+            {
+                self.usage.terminal = Some(StreamTerminal::Completed);
             }
             if let Ok(value) = serde_json::from_slice::<Value>(&self.event_data) {
                 self.observe_value(&value, event_name.as_deref());
@@ -203,8 +240,61 @@ impl UsageObserver {
 
     fn observe_value(&mut self, value: &Value, event_name: Option<&str>) {
         let event_type = value.get("type").and_then(Value::as_str).or(event_name);
-        if matches!(event_type, Some("error" | "response.failed")) {
+        if self.is_sse
+            && matches!(self.protocol, Protocol::Chat)
+            && (value.get("choices").is_some_and(Value::is_array)
+                || value.get("usage").is_some_and(Value::is_object)
+                || value.get("copilot_usage").is_some_and(Value::is_object))
+        {
+            self.saw_chat_payload = true;
+        }
+        let current_error = matches!(event_type, Some("error" | "response.failed"))
+            || value.get("error").is_some_and(|error| !error.is_null())
+            || (matches!(self.protocol, Protocol::Responses)
+                && value.pointer("/response/status").and_then(Value::as_str) == Some("failed"));
+        if current_error {
             self.usage.protocol_error = true;
+            let message = value
+                .pointer("/error/message")
+                .or_else(|| value.pointer("/response/error/message"))
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if message
+                .to_ascii_lowercase()
+                .contains("you have exceeded your monthly quota")
+            {
+                self.usage.monthly_quota_exceeded = true;
+            }
+        }
+        if self.is_sse {
+            match (self.protocol, event_type) {
+                (Protocol::Responses, Some("response.incomplete"))
+                    if value.get("response").is_some_and(Value::is_object) =>
+                {
+                    self.usage.terminal = Some(StreamTerminal::Incomplete);
+                }
+                (Protocol::Responses, Some("response.completed"))
+                    if value.get("response").is_some_and(Value::is_object)
+                        && value.pointer("/response/status").and_then(Value::as_str)
+                            == Some("incomplete") =>
+                {
+                    self.usage.terminal = Some(StreamTerminal::Incomplete);
+                }
+                (Protocol::Responses, Some("response.completed"))
+                    if value.get("response").is_some_and(Value::is_object)
+                        && self.usage.terminal.is_none() =>
+                {
+                    self.usage.terminal = Some(StreamTerminal::Completed);
+                }
+                (Protocol::Messages, Some("message_stop"))
+                    if value.get("type").and_then(Value::as_str) == Some("message_stop")
+                        && self.usage.terminal.is_none() =>
+                {
+                    self.usage.terminal = Some(StreamTerminal::Completed);
+                }
+                _ => {}
+            }
         }
         if self.is_sse
             && self.usage.first_token_ms.is_none()
@@ -221,6 +311,7 @@ impl UsageObserver {
             _ => value,
         };
         if let Some(usage) = container.get("usage").filter(|v| v.is_object()) {
+            crate::usage_details::update(&mut self.usage.token_details, usage);
             let before = (
                 self.usage.input_tokens,
                 self.usage.output_tokens,
@@ -278,8 +369,8 @@ impl UsageObserver {
             assign(&mut self.usage.cache_read_input_tokens, read);
             assign(&mut self.usage.cache_creation_input_tokens, write);
             let input = number(usage, "prompt_tokens").map(|n| {
-                n.saturating_sub(read.unwrap_or(0))
-                    .saturating_sub(write.unwrap_or(0))
+                n.saturating_sub(self.usage.cache_read_input_tokens.unwrap_or(0))
+                    .saturating_sub(self.usage.cache_creation_input_tokens.unwrap_or(0))
                     .max(0)
             });
             assign(&mut self.usage.input_tokens, input);
@@ -298,8 +389,8 @@ impl UsageObserver {
         assign(&mut self.usage.cache_read_input_tokens, read);
         assign(&mut self.usage.cache_creation_input_tokens, write);
         let input = number(usage, "input_tokens").map(|n| {
-            n.saturating_sub(read.unwrap_or(0))
-                .saturating_sub(write.unwrap_or(0))
+            n.saturating_sub(self.usage.cache_read_input_tokens.unwrap_or(0))
+                .saturating_sub(self.usage.cache_creation_input_tokens.unwrap_or(0))
                 .max(0)
         });
         assign(&mut self.usage.input_tokens, input);
@@ -529,6 +620,17 @@ mod tests {
     }
 
     #[test]
+    fn quota_error_detection_does_not_match_normal_model_text() {
+        let mut error = UsageObserver::new("responses", true, Instant::now());
+        error.observe(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"You have exceeded your monthly quota\"}}\n\n");
+        assert!(error.protocol_error());
+        assert!(error.monthly_quota_exceeded());
+        let mut answer = UsageObserver::new("chat_completions", true, Instant::now());
+        answer.observe(b"data: {\"choices\":[{\"delta\":{\"content\":\"You have exceeded your monthly quota\"}}]}\n\n");
+        assert!(!answer.monthly_quota_exceeded());
+    }
+
+    #[test]
     fn later_partial_update_replaces_stale_total_and_cache_is_clamped() {
         let mut observer = UsageObserver::new("chat_completions", true, Instant::now());
         observer.observe(b"data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":0,\"total_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":9}}}\n\n");
@@ -538,5 +640,27 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(3));
         assert_eq!(usage.cache_read_input_tokens, Some(9));
         assert_eq!(usage.total_tokens, Some(12));
+    }
+
+    #[test]
+    fn cumulative_updates_keep_prior_cache_when_details_are_omitted() {
+        let mut chat = UsageObserver::new("chat_completions", true, Instant::now());
+        chat.observe(b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":10,\"cache_creation_input_tokens\":5}}}\n\n");
+        chat.observe(b"data: {\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":4}}\n\n");
+        let chat = chat.finish().unwrap();
+        assert_eq!(chat.input_tokens, Some(105));
+        assert_eq!(chat.cache_read_input_tokens, Some(10));
+        assert_eq!(chat.cache_creation_input_tokens, Some(5));
+        assert_eq!(chat.total_tokens, Some(124));
+        let mut responses = UsageObserver::new("responses", true, Instant::now());
+        responses.observe(b"data: {\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":10,\"cache_write_tokens\":5}}}}\n\n");
+        responses.observe(
+            b"data: {\"response\":{\"usage\":{\"input_tokens\":120,\"output_tokens\":4}}}\n\n",
+        );
+        let responses = responses.finish().unwrap();
+        assert_eq!(responses.input_tokens, Some(105));
+        assert_eq!(responses.cache_read_input_tokens, Some(10));
+        assert_eq!(responses.cache_creation_input_tokens, Some(5));
+        assert_eq!(responses.total_tokens, Some(124));
     }
 }
