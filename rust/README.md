@@ -20,7 +20,7 @@ After signing in, run `./rust/target/release/copilot-api-rust monitor` in an int
 
 - `1`–`5` or Tab: overview, Copilot quota, per-model usage, recent requests and sessions.
 - `p`: change period; `↑`/`↓` or `j`/`k`: select/scroll models, requests or sessions; `←`/`→`: change request/session page. In Requests, `d` opens or closes the selected request's detailed token breakdown; scroll within it with `↑`/`↓`.
-- `r`: refresh local usage and quota; Space: pause/resume automatic refresh; `q` or Ctrl-C: quit.
+- `r`: refresh local usage and quota; Space: pause/resume automatic refresh; `u`: toggle compact K/M/B/T counts and exact counts; `q` or Ctrl-C: quit. `~` marks a rounded compact value. This toggle does not change quota balances or estimated currency amounts.
 - In Quota, `b` then `y` requests opening GitHub's [Copilot settings](https://github.com/settings/copilot/features), where you can choose an available payer. This only opens the page; the gateway does not change billing settings.
 - Usage refreshes every five seconds; quota every 60 seconds and on manual refresh. Stale/error status is shown rather than treating missing data as zero.
 
