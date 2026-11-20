@@ -1,20 +1,30 @@
-use std::{net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use axum::{
     Router,
     body::{Body, to_bytes},
-    extract::{Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use crate::auth::CopilotAuth;
+use crate::{
+    auth::CopilotAuth,
+    quota::QuotaClient,
+    usage::{UsageEvent, UsageStore},
+    usage_stream::UsageStream,
+};
 
 // Request JSON is buffered for header derivation and minor normalization; responses are streamed.
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -27,12 +37,22 @@ struct AppState {
     client: reqwest::Client,
     api_key: Option<String>,
     device_id: String,
+    quota: Option<Arc<QuotaClient>>,
+    usage: Option<Arc<UsageStore>>,
     #[cfg(test)]
     test_credential: Option<crate::auth::CopilotCredential>,
 }
 
-pub fn router(auth: Arc<CopilotAuth>, api_key: Option<String>) -> Result<Router> {
-    Ok(build_router(new_state(auth, api_key)?))
+pub fn router(
+    auth: Arc<CopilotAuth>,
+    api_key: Option<String>,
+    quota: Arc<QuotaClient>,
+    usage: Arc<UsageStore>,
+) -> Result<Router> {
+    let mut state = new_state(auth, api_key)?;
+    state.quota = Some(quota);
+    state.usage = Some(usage);
+    Ok(build_router(state))
 }
 
 fn new_state(auth: Arc<CopilotAuth>, api_key: Option<String>) -> Result<AppState> {
@@ -45,6 +65,8 @@ fn new_state(auth: Arc<CopilotAuth>, api_key: Option<String>) -> Result<AppState
         client,
         api_key,
         device_id: Uuid::new_v4().to_string(),
+        quota: None,
+        usage: None,
         #[cfg(test)]
         test_credential: None,
     })
@@ -63,9 +85,34 @@ pub(crate) fn router_with_test_credential(
     Ok(build_router(state))
 }
 
+#[cfg(test)]
+pub(crate) fn router_with_test_usage(
+    api_base: String,
+    api_key: Option<String>,
+    usage: Arc<UsageStore>,
+) -> Result<Router> {
+    let github = crate::auth::GitHubAuth::new(crate::auth::AuthConfig::default())?;
+    let auth = Arc::new(CopilotAuth::new(github, "test-github-token".into())?);
+    let mut state = new_state(auth, api_key)?;
+    state.test_credential = Some(crate::auth::CopilotCredential {
+        api_base,
+        token: "test-copilot-token".into(),
+    });
+    state.usage = Some(usage);
+    Ok(build_router(state))
+}
+
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(|| async { "copilot-api-rust (partial port)" }))
+        .route("/usage-viewer", get(usage_viewer))
+        .route("/usage-viewer/", get(usage_viewer))
+        .route("/usage", get(account_usage))
+        .route("/usage/{provider}", get(subscription_usage))
+        .route("/token-usage", get(token_summary))
+        .route("/token-usage/daily", get(token_daily))
+        .route("/token-usage/events", get(token_events))
+        .route("/token-usage/sessions", get(token_sessions))
         .route("/models", get(proxy))
         .route("/v1/models", get(proxy))
         .route("/chat/completions", post(proxy))
@@ -217,6 +264,149 @@ fn error(status: StatusCode, message: &'static str) -> Response {
     (status, axum::Json(json!({"error": {"message": message}}))).into_response()
 }
 
+async fn usage_viewer() -> Response {
+    // Keep the original viewer, but default to the origin that served it instead
+    // of assuming localhost:4141, which breaks on custom ports and 127.0.0.1.
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let page = PAGE.get_or_init(|| {
+        include_str!("../../pages/index.html")
+            .replace(
+                "const DEFAULT_ENDPOINT = \"http://localhost:4141/usage\";",
+                "const DEFAULT_ENDPOINT = window.location.origin + \"/usage\";",
+            )
+            .replace(
+                "if (endpointFromUrl) {\n            if (state.activeTab",
+                "if (initialEndpoint) {\n            if (state.activeTab",
+            )
+    });
+    ([(header::CACHE_CONTROL, "no-store")], Html(page.as_str())).into_response()
+}
+
+async fn account_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, state.api_key.as_deref()) {
+        return error(StatusCode::UNAUTHORIZED, "Invalid or missing API key");
+    }
+    let Some(quota) = &state.quota else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Usage is unavailable");
+    };
+    match quota.fetch_raw().await {
+        Ok(value) => ([(header::CACHE_CONTROL, "no-store")], axum::Json(value)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error":"Failed to fetch Copilot usage"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn subscription_usage(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers, state.api_key.as_deref()) {
+        return error(StatusCode::UNAUTHORIZED, "Invalid or missing API key");
+    }
+    if provider != "github-copilot" {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error":"Unsupported subscription provider"})),
+        )
+            .into_response();
+    }
+    let Some(quota) = &state.quota else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Usage is unavailable");
+    };
+    match quota.fetch_normalized().await {
+        Ok(value) => ([(header::CACHE_CONTROL, "no-store")], axum::Json(value)).into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(json!({"error":"Failed to fetch subscription usage"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UsageQuery {
+    Summary,
+    Daily,
+    Events,
+    Sessions,
+}
+
+async fn query_usage(
+    state: AppState,
+    headers: HeaderMap,
+    query: HashMap<String, String>,
+    kind: UsageQuery,
+) -> Response {
+    if !authorized(&headers, state.api_key.as_deref()) {
+        return error(StatusCode::UNAUTHORIZED, "Invalid or missing API key");
+    }
+    let Some(usage) = state.usage else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Usage storage is unavailable",
+        );
+    };
+    let period = query
+        .get("period")
+        .cloned()
+        .unwrap_or_else(|| "today".into());
+    let page = query
+        .get("page")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1);
+    let page_size = query
+        .get("page_size")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(20)
+        .min(100);
+    let result = tokio::task::spawn_blocking(move || match kind {
+        UsageQuery::Summary => usage.summary(&period),
+        UsageQuery::Daily => usage.daily(&period),
+        UsageQuery::Events => usage.events(&period, page, page_size),
+        UsageQuery::Sessions => usage.sessions(&period, page, page_size),
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => ([(header::CACHE_CONTROL, "no-store")], axum::Json(value)).into_response(),
+        _ => error(StatusCode::INTERNAL_SERVER_ERROR, "Usage query failed"),
+    }
+}
+
+async fn token_summary(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    query_usage(s, h, q, UsageQuery::Summary).await
+}
+async fn token_daily(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    query_usage(s, h, q, UsageQuery::Daily).await
+}
+async fn token_events(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    query_usage(s, h, q, UsageQuery::Events).await
+}
+async fn token_sessions(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    query_usage(s, h, q, UsageQuery::Sessions).await
+}
+
 fn upstream_path(path: &str) -> &str {
     match path {
         "/v1/models" => "/models",
@@ -334,6 +524,47 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // The base URL has been validated by the credential module; no client-supplied URL is used.
     let url = format!("{}{}", credential.api_base.trim_end_matches('/'), path);
     let id = Uuid::new_v4().to_string();
+    let started = Instant::now();
+    let endpoint = match path.as_str() {
+        "/chat/completions" => Some("chat_completions"),
+        "/responses" => Some("responses"),
+        "/embeddings" => Some("embeddings"),
+        "/v1/messages" => Some("messages"),
+        _ => None,
+    };
+    let event = endpoint.map(|endpoint| {
+        let payload = serde_json::from_slice::<Value>(&body).ok();
+        let model = payload
+            .as_ref()
+            .and_then(|v| v.get("model"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .chars()
+            .take(256)
+            .collect();
+        let session_id = headers
+            .get("x-session-affinity")
+            .or_else(|| headers.get("x-session-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.chars().take(256).collect())
+            .unwrap_or_else(|| id.clone());
+        let user_agent = headers
+            .get(header::USER_AGENT)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .chars()
+            .take(64)
+            .collect();
+        UsageEvent {
+            model,
+            endpoint: endpoint.into(),
+            session_id,
+            trace_id: id.clone(),
+            request_id: Some(id.clone()),
+            user_agent,
+            ..UsageEvent::default()
+        }
+    });
     let interaction = if path == "/models" {
         "model-access"
     } else {
@@ -383,6 +614,15 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         }
     };
     let status = upstream.status();
+    let sse = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
     let mut response = Response::builder().status(status);
     for name in [
         header::CONTENT_TYPE,
@@ -393,7 +633,18 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             response = response.header(name, value);
         }
     }
-    match response.body(Body::from_stream(upstream.bytes_stream())) {
+    let body = match (event, state.usage) {
+        (Some(event), Some(store)) => Body::from_stream(UsageStream::new(
+            upstream.bytes_stream(),
+            store,
+            event,
+            sse,
+            started,
+            status.is_success(),
+        )),
+        _ => Body::from_stream(upstream.bytes_stream()),
+    };
+    match response.body(body) {
         Ok(response) => response,
         Err(_) => error(StatusCode::BAD_GATEWAY, "Invalid upstream response"),
     }
