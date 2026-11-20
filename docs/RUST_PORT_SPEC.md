@@ -4,6 +4,8 @@
 
 - Create a Rust fork of <https://github.com/caozhiyuan/copilot-api>, commit incrementally, create a public GitHub fork, and push it. (User, 2026-11-20.)
 - Consider low memory usage, but do not over-optimize. (User, 2026-11-20.)
+- Implement usage monitoring like the original project. (User, 2026-11-20.)
+- Implement GitHub sign-in if it is not already present. (User, 2026-11-20.)
 
 ## Implementation notes (not user requirements)
 
