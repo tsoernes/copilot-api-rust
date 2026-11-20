@@ -14,6 +14,17 @@ cargo build --locked --release --manifest-path rust/Cargo.toml
 
 The server defaults to `127.0.0.1:4141`. Configure `COPILOT_API_KEY` to require client `Authorization: Bearer ...` or `x-api-key` and to permit a non-loopback listen address, e.g. `serve --listen 0.0.0.0:4141`. The server does **not** provide TLS: use a trusted TLS-terminating reverse proxy for remote access. The health root requires no key. Browser Origin requests are rejected; without a key, Host must be loopback. POST requests require `application/json`. Do not expose the service directly on an untrusted network.
 
+## Terminal monitor
+
+After signing in, run `./rust/target/release/copilot-api-rust monitor` in an interactive terminal. This starts its own server and dashboard together; quitting the dashboard also stops that server. Use `--listen` and `COPILOT_API_KEY` as with `serve`; the monitor connects locally to its own listener, so it accepts loopback or wildcard listen addresses. The existing `serve` command runs without a TUI. Recent server errors are shown in the dashboard instead of being printed over it.
+
+- `1`–`4` or Tab: overview, Copilot quota, per-model usage, recent requests.
+- `p`: change period; `↑`/`↓` or `j`/`k`: scroll models or requests; `←`/`→`: change request page.
+- `r`: refresh local usage and quota; Space: pause/resume automatic refresh; `q` or Ctrl-C: quit.
+- Usage refreshes every five seconds; quota every 60 seconds and on manual refresh. Stale/error status is shown rather than treating missing data as zero.
+
+The monitor displays upstream-reported, persisted usage: in-flight requests may not appear until they complete or are cancelled. Quota requires a working GitHub sign-in; costs are estimates, not bills. A terminal of at least 42 columns by 10 rows is needed for the full layout.
+
 ## Usage monitoring
 
 Open the usage-viewer address printed by `serve`. This serves the original upstream dashboard with the current server as its default endpoint. It includes period selection, charts, model/session summaries and paginated events. Enter the configured API key in the dashboard if needed. The original viewer loads JavaScript and fonts from third-party CDNs and stores entered credentials in browser local storage; use it only in a trusted browser and network.
