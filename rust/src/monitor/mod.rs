@@ -131,6 +131,7 @@ struct App {
     selected_event_id: Option<i64>,
     confirm_billing: bool,
     notice: Option<String>,
+    exact_counts: bool,
     paused: bool,
     summary: Option<Value>,
     daily: Option<Value>,
@@ -331,6 +332,10 @@ impl App {
                 Action::Usage
             }
             KeyCode::Char('r') => Action::Both,
+            KeyCode::Char('u') => {
+                self.exact_counts = !self.exact_counts;
+                Action::None
+            }
             KeyCode::Char('b') if self.tab == 1 => {
                 self.confirm_billing = true;
                 Action::None
@@ -624,6 +629,7 @@ pub async fn run(
                     show_event_detail: app.show_event_detail,
                     detail_scroll: app.detail_scroll,
                     confirm_billing: app.confirm_billing,
+                    exact_counts: app.exact_counts,
                     paused: app.paused,
                     last_updated: &age,
                     error: error.as_deref(),
@@ -718,6 +724,10 @@ mod tests {
         assert!(app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)) == Action::Both);
         assert!(app.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)) == Action::Both);
         assert!(!app.paused);
+        assert!(app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)) == Action::None);
+        assert!(app.exact_counts);
+        assert!(app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)) == Action::None);
+        assert!(!app.exact_counts);
         app.apply_quota(Ok(serde_json::json!({"windows":[]})));
         assert!(app.quota_updated.is_some());
         app.apply_quota(Err("network error".into()));

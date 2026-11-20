@@ -29,6 +29,7 @@ pub struct View<'a> {
     pub show_event_detail: bool,
     pub detail_scroll: usize,
     pub confirm_billing: bool,
+    pub exact_counts: bool,
     pub paused: bool,
     pub last_updated: &'a str,
     pub error: Option<&'a str>,
@@ -78,20 +79,73 @@ fn text(value: &Value, name: &str) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-fn number(value: Option<&Value>) -> String {
-    let Some(value) = value.and_then(Value::as_i64) else {
-        return "—".into();
-    };
+fn grouped_unsigned(value: u128) -> String {
     let s = value.to_string();
     let mut out = String::new();
     let chars: Vec<char> = s.chars().collect();
     for (i, c) in chars.iter().enumerate() {
-        if i > 0 && (chars.len() - i).is_multiple_of(3) && *c != '-' && chars[0] != '-' {
+        if i > 0 && (chars.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*c);
     }
     out
+}
+
+fn count(value: Option<&Value>, exact: bool) -> String {
+    let Some(value) = value else {
+        return "—".into();
+    };
+    let signed = if let Some(n) = value.as_i64() {
+        i128::from(n)
+    } else if let Some(n) = value.as_u64() {
+        i128::from(n)
+    } else {
+        return "—".into();
+    };
+    let negative = signed < 0;
+    let magnitude = signed.unsigned_abs();
+    let sign = if negative { "-" } else { "" };
+    if exact || magnitude < 1_000 {
+        return format!("{sign}{}", grouped_unsigned(magnitude));
+    }
+    const UNITS: &[(u128, &str)] = &[
+        (1_000, "K"),
+        (1_000_000, "M"),
+        (1_000_000_000, "B"),
+        (1_000_000_000_000, "T"),
+    ];
+    let mut index = UNITS
+        .iter()
+        .rposition(|(divisor, _)| magnitude >= *divisor)
+        .unwrap_or(0);
+    loop {
+        let (divisor, suffix) = UNITS[index];
+        let scaled = (magnitude * 100 + divisor / 2) / divisor;
+        if scaled >= 100_000 && index + 1 < UNITS.len() {
+            index += 1;
+            continue;
+        }
+        let approx = if magnitude * 100 == scaled * divisor {
+            ""
+        } else {
+            "~"
+        };
+        let fraction = match scaled % 100 {
+            0 => String::new(),
+            n if n % 10 == 0 => format!(".{}", n / 10),
+            n => format!(".{n:02}"),
+        };
+        return format!(
+            "{approx}{sign}{}{fraction}{suffix}",
+            grouped_unsigned(scaled / 100)
+        );
+    }
+}
+
+// Quota quantities deliberately use the exact form, not the count-mode toggle.
+fn number(value: Option<&Value>) -> String {
+    count(value, true)
 }
 
 fn cost(value: &Value) -> String {
@@ -173,7 +227,7 @@ fn quota_quantity(value: Option<&Value>) -> String {
 
 /// Rolling windows are reported event counts, not all HTTP requests or an
 /// extrapolated rate. Preserve missing fields as unavailable.
-fn rate_lines(rates: Option<&Value>, width: usize) -> Vec<String> {
+fn rate_lines(rates: Option<&Value>, width: usize, exact: bool) -> Vec<String> {
     let Some(windows) = rates
         .and_then(|v| v.get("windows"))
         .and_then(Value::as_array)
@@ -197,8 +251,8 @@ fn rate_lines(rates: Option<&Value>, width: usize) -> Vec<String> {
             None => default_label.into(),
         };
         let totals = window.get("totals").unwrap_or(&Value::Null);
-        let requests = number(totals.get("request_count"));
-        let tokens = number(totals.get("total_tokens"));
+        let requests = count(totals.get("request_count"), exact);
+        let tokens = count(totals.get("total_tokens"), exact);
         let estimated = cost(totals);
         let combined = format!("{label}: {requests} req / {tokens} tok · est {estimated}");
         if combined.chars().count() <= width {
@@ -268,7 +322,12 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "  {}   {}",
+            "  {}  {}   {}",
+            if view.exact_counts {
+                "EXACT"
+            } else {
+                "K/M (~ rounded)"
+            },
             endpoint_label(view.endpoint),
             clean(view.period)
         )),
@@ -302,13 +361,13 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         _ => sessions(frame, parts[2], view),
     }
     let controls = if view.tab == 1 {
-        " 1–5/Tab views  p period  r refresh  space pause  b billing settings  q quit"
+        " 1–5 Tab  u units  b billing settings  p period  r refresh  space pause  q quit"
     } else if view.tab == 3 && view.show_event_detail {
-        " ↑/↓ detail  d return  ←/→ page  p period  r refresh  q quit"
+        " ↑/↓ detail  u units  d return  ←/→ page  p period  r refresh  q quit"
     } else if view.tab == 3 {
-        " 1–5/Tab views  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  d detail  q quit"
+        " 1–5 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  d detail  q quit"
     } else {
-        " 1–5/Tab views  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit"
+        " 1–5 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit"
     };
     let footer = if let Some(error) = view.error {
         vec![
@@ -322,7 +381,7 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         vec![
             Line::styled(controls, Style::default().fg(MUTED)),
             Line::styled(
-                " Usage is upstream-reported; cost is estimated, not a bill.",
+                " ~ = rounded; counts are reported; costs are estimated, not bills.",
                 Style::default().fg(MUTED),
             ),
         ]
@@ -353,7 +412,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         .and_then(|s| s.get("totals"))
         .unwrap_or(&Value::Null);
     let width = usize::from(area.width.saturating_sub(2));
-    let rolling = wrap_physical_lines(rate_lines(view.rates, width), width);
+    let rolling = wrap_physical_lines(rate_lines(view.rates, width, view.exact_counts), width);
     let rate_height = u16::try_from(rolling.len().saturating_add(2)).unwrap_or(u16::MAX);
     if view.rates.is_some()
         && area.height
@@ -382,13 +441,13 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         (
             cards[0],
             "Requests",
-            number(totals.get("request_count")),
+            count(totals.get("request_count"), view.exact_counts),
             Color::Magenta,
         ),
         (
             cards[1],
             "Tokens",
-            number(totals.get("total_tokens")),
+            count(totals.get("total_tokens"), view.exact_counts),
             ACCENT,
         ),
         (
@@ -396,8 +455,8 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             "Input / Output",
             format!(
                 "{} / {}",
-                number(totals.get("input_tokens")),
-                number(totals.get("output_tokens"))
+                count(totals.get("input_tokens"), view.exact_counts),
+                count(totals.get("output_tokens"), view.exact_counts)
             ),
             Color::Green,
         ),
@@ -418,9 +477,9 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     .split(parts[1]);
     let detail = format!(
         " Cache read: {}    Cache write: {}    Nano-AIU: {}",
-        number(totals.get("cache_read_input_tokens")),
-        number(totals.get("cache_creation_input_tokens")),
-        number(totals.get("total_nano_aiu"))
+        count(totals.get("cache_read_input_tokens"), view.exact_counts),
+        count(totals.get("cache_creation_input_tokens"), view.exact_counts),
+        count(totals.get("total_nano_aiu"), view.exact_counts)
     );
     frame.render_widget(
         Paragraph::new(detail).block(panel("Cache & Copilot")),
@@ -642,7 +701,7 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         .iter()
         .map(|(label, key)| {
             rows.iter()
-                .map(|m| number(m.get(*key)).len())
+                .map(|m| count(m.get(*key), view.exact_counts).len())
                 .max()
                 .unwrap_or(0)
                 .max(label.len())
@@ -690,9 +749,9 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         let model = &rows[offset];
         let mut lines = vec![format!("Model: {}", text(model, "model"))];
         lines.extend(
-            columns
-                .iter()
-                .map(|(label, key)| format!("{label}: {}", number(model.get(*key)))),
+            columns.iter().map(|(label, key)| {
+                format!("{label}: {}", count(model.get(*key), view.exact_counts))
+            }),
         );
         lines.push(format!("Estimated cost: {}", cost(model)));
         lines.push(format!(
@@ -734,7 +793,7 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             cells.extend(
                 columns
                     .iter()
-                    .map(|(_, key)| Cell::from(number(m.get(*key)))),
+                    .map(|(_, key)| Cell::from(count(m.get(*key), view.exact_counts))),
             );
             cells.push(Cell::from(cost(m)));
             cells.push(Cell::from(decimal(m.get("average_first_token_ms"))));
@@ -779,20 +838,20 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
 
 /// Build physical lines once for consistent rendering and scroll bounds. The
 /// detail object is deliberately never summed: provider fields may overlap.
-fn event_detail_lines(event: &Value) -> Vec<String> {
+fn event_detail_lines(event: &Value, exact: bool) -> Vec<String> {
     let mut lines = vec![
         format!("Model: {}", text(event, "model")),
-        format!("Input: {}", number(event.get("input_tokens"))),
-        format!("Output: {}", number(event.get("output_tokens"))),
+        format!("Input: {}", count(event.get("input_tokens"), exact)),
+        format!("Output: {}", count(event.get("output_tokens"), exact)),
         format!(
             "Cache read: {}",
-            number(event.get("cache_read_input_tokens"))
+            count(event.get("cache_read_input_tokens"), exact)
         ),
         format!(
             "Cache write: {}",
-            number(event.get("cache_creation_input_tokens"))
+            count(event.get("cache_creation_input_tokens"), exact)
         ),
-        format!("Total: {}", number(event.get("total_tokens"))),
+        format!("Total: {}", count(event.get("total_tokens"), exact)),
         "".into(),
         "Provider-reported subcounts:".into(),
         "Overlapping; do not sum.".into(),
@@ -812,7 +871,7 @@ fn event_detail_lines(event: &Value) -> Vec<String> {
         lines.push("Not reported (including older rows).".into());
     } else {
         let omitted = details.len().saturating_sub(256);
-        for (name, count) in details.into_iter().take(256) {
+        for (name, value) in details.into_iter().take(256) {
             // Names are normally ASCII field paths. Non-ASCII names use half
             // the minimum content width to accommodate double-width glyphs.
             let width = if name.is_ascii() { 38 } else { 19 };
@@ -823,7 +882,7 @@ fn event_detail_lines(event: &Value) -> Vec<String> {
             for chunk in chars.chunks(width) {
                 lines.push(chunk.iter().collect());
             }
-            lines.push(format!("  {}", number(Some(&Value::from(count)))));
+            lines.push(format!("  {}", count(Some(&Value::from(value)), exact)));
         }
         if omitted > 0 {
             lines.push(format!("{omitted} additional fields not shown"));
@@ -834,7 +893,7 @@ fn event_detail_lines(event: &Value) -> Vec<String> {
 
 /// Number of rendered detail lines for clamping keyboard scrolling.
 pub(crate) fn event_detail_line_count(event: &Value) -> usize {
-    event_detail_lines(event).len()
+    event_detail_lines(event, false).len()
 }
 
 fn sessions(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
@@ -870,7 +929,11 @@ fn sessions(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     let scoped_rates = view.session_rates.filter(|r| {
         selected_id.is_some() && r.get("session_id").and_then(Value::as_str) == selected_id
     });
-    let mut rolling = rate_lines(scoped_rates, usize::from(area.width.saturating_sub(2)));
+    let mut rolling = rate_lines(
+        scoped_rates,
+        usize::from(area.width.saturating_sub(2)),
+        view.exact_counts,
+    );
     if scoped_rates.is_none() {
         rolling = vec!["Session rates: unavailable".into()];
     }
@@ -897,7 +960,7 @@ fn sessions(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         .iter()
         .map(|(label, key)| {
             rows.iter()
-                .map(|row| number(row.get(*key)).len())
+                .map(|row| count(row.get(*key), view.exact_counts).len())
                 .max()
                 .unwrap_or(0)
                 .max(label.len())
@@ -925,11 +988,9 @@ fn sessions(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         for part in chars.chunks(chunk.max(1)) {
             lines.push(part.iter().collect());
         }
-        lines.extend(
-            columns
-                .iter()
-                .map(|(label, key)| format!("{label}: {}", number(selected.get(*key)))),
-        );
+        lines.extend(columns.iter().map(|(label, key)| {
+            format!("{label}: {}", count(selected.get(*key), view.exact_counts))
+        }));
         lines.push(format!("Estimated cost: {}", cost(selected)));
         lines.push("Rolling reported counts:".into());
         lines.extend(rolling);
@@ -988,7 +1049,7 @@ fn sessions(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             cells.extend(
                 columns
                     .iter()
-                    .map(|(_, key)| Cell::from(number(row.get(*key)))),
+                    .map(|(_, key)| Cell::from(count(row.get(*key), view.exact_counts))),
             );
             cells.push(Cell::from(cost(row)));
             Row::new(cells).style(if index == 0 {
@@ -1057,7 +1118,7 @@ fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     }
     let offset = view.event_offset.min(rows.len().saturating_sub(1));
     if view.show_event_detail {
-        let lines = event_detail_lines(&rows[offset]);
+        let lines = event_detail_lines(&rows[offset], view.exact_counts);
         let maximum = lines.len().saturating_sub(1).min(u16::MAX as usize);
         let scroll = u16::try_from(view.detail_scroll.min(maximum)).unwrap_or(u16::MAX);
         let detail_title = format!(
@@ -1085,7 +1146,7 @@ fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         .map(|(label, key)| {
             let length = rows
                 .iter()
-                .map(|e| number(e.get(*key)).len())
+                .map(|e| count(e.get(*key), view.exact_counts).len())
                 .max()
                 .unwrap_or(0)
                 .max(label.len());
@@ -1136,11 +1197,12 @@ fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             text(event, "request_outcome")
         );
         let mut lines = vec![Line::styled(heading, Style::default().fg(ACCENT))];
-        lines.extend(
-            columns
-                .iter()
-                .map(|(label, key)| Line::from(format!("{label}: {}", number(event.get(*key))))),
-        );
+        lines.extend(columns.iter().map(|(label, key)| {
+            Line::from(format!(
+                "{label}: {}",
+                count(event.get(*key), view.exact_counts)
+            ))
+        }));
         frame.render_widget(Paragraph::new(lines).block(panel(&title)), area);
         return;
     }
@@ -1170,11 +1232,14 @@ fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
                     text(e, "model")
                 }),
                 Cell::from(text(e, "endpoint")),
-                Cell::from(number(e.get("input_tokens"))),
-                Cell::from(number(e.get("output_tokens"))),
-                Cell::from(number(e.get("cache_read_input_tokens"))),
-                Cell::from(number(e.get("cache_creation_input_tokens"))),
-                Cell::from(number(e.get("total_tokens"))),
+                Cell::from(count(e.get("input_tokens"), view.exact_counts)),
+                Cell::from(count(e.get("output_tokens"), view.exact_counts)),
+                Cell::from(count(e.get("cache_read_input_tokens"), view.exact_counts)),
+                Cell::from(count(
+                    e.get("cache_creation_input_tokens"),
+                    view.exact_counts,
+                )),
+                Cell::from(count(e.get("total_tokens"), view.exact_counts)),
                 Cell::from(outcome).style(Style::default().fg(color)),
             ])
             .style(if index == 0 {
@@ -1248,6 +1313,7 @@ mod tests {
             show_event_detail: false,
             detail_scroll: 0,
             confirm_billing: false,
+            exact_counts: true,
             paused: false,
             last_updated: "now",
             error: None,
@@ -1508,7 +1574,7 @@ mod tests {
     #[test]
     fn detail_long_fields_and_values_are_bounded_on_small_terminals() {
         let event = json!({"token_details": {"an_extremely_long_provider_reported_token_field_name_that_must_be_wrapped":i64::MAX}});
-        let lines = event_detail_lines(&event);
+        let lines = event_detail_lines(&event, true);
         assert!(
             lines
                 .iter()
@@ -1517,7 +1583,7 @@ mod tests {
         assert!(lines.iter().all(|line| line.chars().count() <= 38));
         let unsafe_event = json!({"token_details":{"path\u{1b}[31m":2}});
         assert!(
-            event_detail_lines(&unsafe_event)
+            event_detail_lines(&unsafe_event, true)
                 .iter()
                 .all(|line| !line.contains('\u{1b}'))
         );
@@ -1725,6 +1791,84 @@ mod tests {
             );
             assert!(display.contains("ures"), "{display}");
         }
+    }
+
+    #[test]
+    fn count_units_are_exact_or_explicitly_approximate_without_float_precision_loss() {
+        for (value, expected) in [
+            (0i64, "0"),
+            (999, "999"),
+            (1000, "1K"),
+            (1200, "1.2K"),
+            (1230, "1.23K"),
+            (1234, "~1.23K"),
+            (999_995, "~1M"),
+            (1_000_000, "1M"),
+            (1_500_000, "1.5M"),
+            (1_000_000_000, "1B"),
+            (1_000_000_000_000, "1T"),
+            (-1234, "~-1.23K"),
+            (i64::MAX, "~9,223,372.04T"),
+        ] {
+            assert_eq!(count(Some(&json!(value)), false), expected, "{value}");
+        }
+        assert_eq!(
+            count(Some(&json!(i64::MIN)), true),
+            "-9,223,372,036,854,775,808"
+        );
+        assert_eq!(
+            count(Some(&json!(u64::MAX)), true),
+            "18,446,744,073,709,551,615"
+        );
+        assert_eq!(count(Some(&json!(u64::MAX)), false), "~18,446,744.07T");
+        assert_eq!(count(None, false), "—");
+        assert_eq!(count(Some(&json!(1.5)), false), "—");
+        assert_eq!(quota_quantity(Some(&json!(144853.3))), "144,853.3");
+    }
+
+    #[test]
+    fn count_toggle_reformats_all_usage_views_and_preserves_costs_and_quota() {
+        let null = Value::Null;
+        let totals = json!({"request_count":1200,"input_tokens":1234,"output_tokens":5678,"cache_read_input_tokens":1500,"cache_creation_input_tokens":4000,"total_tokens":11412,"total_nano_aiu":1234,"costs":[{"currency":"USD","amount":0.01}]});
+        let summary = json!({"totals":totals,"byModel":[{"model":"example","request_count":1200,"input_tokens":1234,"output_tokens":5678,"cache_read_input_tokens":1500,"cache_creation_input_tokens":4000,"total_tokens":11412,"costs":[{"currency":"USD","amount":0.01}]}]});
+        let events = json!({"items":[{"model":"example","input_tokens":1234,"output_tokens":5678,"cache_read_input_tokens":1500,"cache_creation_input_tokens":4000,"total_tokens":11412,"token_details":{"output_tokens_details.reasoning_tokens":1234}}],"total_pages":1});
+        let sessions_data = json!({"items":[{"session_id":"session","request_count":1200,"input_tokens":1234,"output_tokens":5678,"cache_read_input_tokens":1500,"cache_creation_input_tokens":4000,"total_tokens":11412,"costs":[{"currency":"USD","amount":0.01}]}],"total_pages":1});
+        let rates = json!({"windows":[{"id":"minute","duration_seconds":60,"totals":{"request_count":1200,"total_tokens":1234}},{"id":"hour","duration_seconds":3600,"totals":{}},{"id":"day","duration_seconds":86400,"totals":{}}]});
+        let session_rates = json!({"session_id":"session","windows":rates["windows"]});
+        let quota = json!({"tokenBasedBilling":true,"windows":[{"name":"Premium","remaining":144853.3,"reportedQuotaRemaining":144853.3}]});
+        let mut v = view(&summary, &null, &events, &quota);
+        v.sessions = Some(&sessions_data);
+        v.rates = Some(&rates);
+        v.session_rates = Some(&session_rates);
+        let mut terminal = Terminal::new(TestBackend::new(178, 46)).unwrap();
+        v.exact_counts = false;
+        for tab in [0, 2, 3, 4] {
+            v.tab = tab;
+            terminal.draw(|f| render(f, &v)).unwrap();
+            let display = render_text(&terminal);
+            assert!(display.contains("~1.23K"), "tab {tab}: {display}");
+            assert!(display.contains("u units"), "tab {tab}: {display}");
+        }
+        v.tab = 3;
+        v.show_event_detail = true;
+        terminal.draw(|f| render(f, &v)).unwrap();
+        assert!(render_text(&terminal).contains("~1.23K"));
+        v.exact_counts = true;
+        terminal.draw(|f| render(f, &v)).unwrap();
+        assert!(render_text(&terminal).contains("1,234"));
+        v.tab = 0;
+        v.show_event_detail = false;
+        terminal.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&terminal);
+        assert!(display.contains("1,234"));
+        assert!(display.contains("USD 0.0100"));
+        v.exact_counts = false;
+        v.tab = 1;
+        terminal.draw(|f| render(f, &v)).unwrap();
+        assert!(render_text(&terminal).contains("144,853.3"));
+        let mut narrow = Terminal::new(TestBackend::new(42, 24)).unwrap();
+        narrow.draw(|f| render(f, &v)).unwrap();
+        assert!(render_text(&narrow).contains("u units"));
     }
 
     #[test]
