@@ -6,6 +6,8 @@
 - Consider low memory usage, but do not over-optimize. (User, 2026-11-20.)
 - Implement usage monitoring like the original project. (User, 2026-11-20.)
 - Implement GitHub sign-in if it is not already present. (User, 2026-11-20.)
+- Implement a rich terminal UI for monitoring. Start the server and dashboard together; prioritize an overview, quota, models and recent requests, with a five-second refresh. (User, 2026-11-20.)
+- Refresh GitHub quota every 60 seconds and on manual refresh, while local statistics refresh every five seconds. (User, 2026-11-20.)
 
 ## Implementation notes (not user requirements)
 
