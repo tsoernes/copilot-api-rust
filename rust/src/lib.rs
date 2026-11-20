@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod auth;
+pub mod monitor;
 pub mod quota;
 pub mod server;
 pub mod usage;
