@@ -102,6 +102,43 @@ fn app(base: &str, key: Option<&str>) -> Router {
 }
 
 #[tokio::test]
+async fn models_endpoint_uses_copilot_model_access_and_preserves_catalog() {
+    let mut upstream = mock(StatusCode::OK).await;
+    upstream
+        .chunks
+        .send(Bytes::from_static(
+            br#"{"data":[{"id":"fake-model","capabilities":{"type":"chat"}}]}"#,
+        ))
+        .unwrap();
+    let request = Request::builder()
+        .uri("/v1/models")
+        .header(header::HOST, "localhost:4141")
+        .header(header::AUTHORIZATION, "Bearer local-secret")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(&upstream.base, Some("local-secret"))
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = upstream.requests.recv().await.unwrap();
+    assert_eq!(captured.path, "/models");
+    assert_eq!(
+        captured.headers[header::AUTHORIZATION],
+        "Bearer fake-copilot-token"
+    );
+    assert_eq!(captured.headers["x-interaction-type"], "model-access");
+    let mut body = response.into_body().into_data_stream();
+    let data = tokio::time::timeout(Duration::from_secs(2), body.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+    assert_eq!(json["data"][0]["id"], "fake-model");
+}
+
+#[tokio::test]
 async fn forwards_allowed_headers_body_and_status_but_not_client_secrets() {
     let mut upstream = mock(StatusCode::TOO_MANY_REQUESTS).await;
     upstream

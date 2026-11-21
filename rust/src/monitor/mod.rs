@@ -1,4 +1,7 @@
+mod catalog;
+mod catalog_ui;
 mod data;
+mod pricing_reference;
 mod ui;
 
 use std::{
@@ -24,7 +27,16 @@ use tokio::{
 };
 use tracing_subscriber::fmt::MakeWriter;
 
+use catalog::{CatalogModel, SortKey, SortOrder};
 use data::{MonitorClient, UsageSnapshot};
+
+fn sort_models(models: &mut [CatalogModel], key: SortKey, order: SortOrder) {
+    if key == SortKey::Output && order == SortOrder::Descending {
+        catalog::sort_catalog(models);
+    } else {
+        catalog::sort_catalog_by(models, key, order);
+    }
+}
 
 const PERIODS: &[&str] = &[
     "today",
@@ -123,6 +135,9 @@ struct App {
     period: usize,
     page: usize,
     model_offset: usize,
+    show_model_detail: bool,
+    model_detail_scroll: u16,
+    selected_model_id: Option<String>,
     event_offset: usize,
     session_page: usize,
     session_offset: usize,
@@ -140,6 +155,13 @@ struct App {
     rates: Option<Value>,
     session_rates: Option<Value>,
     quota: Option<Value>,
+    catalog: Option<Vec<CatalogModel>>,
+    catalog_selected: usize,
+    catalog_detail_scroll: u16,
+    catalog_sort_key: SortKey,
+    catalog_sort_order: SortOrder,
+    catalog_updated: Option<Instant>,
+    catalog_error: Option<String>,
     usage_updated: Option<Instant>,
     quota_updated: Option<Instant>,
     usage_error: Option<String>,
@@ -156,6 +178,9 @@ impl App {
         self.sessions = None;
         self.session_rates = None;
         self.usage_updated = None;
+        self.show_model_detail = false;
+        self.model_detail_scroll = 0;
+        self.selected_model_id = None;
     }
     fn apply_usage(&mut self, snapshot: UsageSnapshot) {
         let mut failures = Vec::new();
@@ -204,6 +229,20 @@ impl App {
             .and_then(|v| v.get("byModel"))
             .and_then(Value::as_array)
         {
+            if self.show_model_detail
+                && let Some(id) = self.selected_model_id.as_deref()
+            {
+                if let Some(index) = models
+                    .iter()
+                    .position(|model| model.get("model").and_then(Value::as_str) == Some(id))
+                {
+                    self.model_offset = index;
+                } else {
+                    self.show_model_detail = false;
+                    self.model_detail_scroll = 0;
+                    self.selected_model_id = None;
+                }
+            }
             self.model_offset = self.model_offset.min(models.len().saturating_sub(1));
         }
         if let Some(events) = self
@@ -233,6 +272,66 @@ impl App {
             self.usage_error = None;
         } else {
             self.usage_error = Some(format!("STALE / unavailable: {}", failures.join("; ")));
+        }
+    }
+    fn sort_catalog(&mut self) {
+        let selected = self
+            .catalog
+            .as_ref()
+            .and_then(|models| models.get(self.catalog_selected))
+            .map(|m| m.id.clone());
+        if let Some(models) = &mut self.catalog {
+            sort_models(models, self.catalog_sort_key, self.catalog_sort_order);
+            self.catalog_selected = selected
+                .as_ref()
+                .and_then(|id| models.iter().position(|model| &model.id == id))
+                .unwrap_or(0);
+        }
+        self.catalog_detail_scroll = 0;
+    }
+    fn apply_catalog(&mut self, result: std::result::Result<Value, String>) {
+        let selected = self
+            .catalog
+            .as_ref()
+            .and_then(|models| models.get(self.catalog_selected))
+            .map(|m| m.id.clone());
+        match result.and_then(|value| catalog::parse_catalog(&value).map_err(str::to_owned)) {
+            Ok(mut models) => {
+                pricing_reference::annotate_official_prices(&mut models);
+                sort_models(&mut models, self.catalog_sort_key, self.catalog_sort_order);
+                self.catalog_selected = selected
+                    .as_ref()
+                    .and_then(|id| models.iter().position(|model| &model.id == id))
+                    .unwrap_or(0);
+                self.catalog = Some(models);
+                self.catalog_updated = Some(Instant::now());
+                self.catalog_error = None;
+            }
+            Err(error) => {
+                self.catalog_error = Some(format!("Catalog stale / unavailable: {error}"));
+                if let Some(models) = &mut self.catalog {
+                    pricing_reference::annotate_official_prices(models);
+                }
+                self.sort_catalog();
+            }
+        }
+    }
+    fn catalog_sort_label(&self) -> String {
+        let key = match self.catalog_sort_key {
+            SortKey::Output => "output",
+            SortKey::Input => "input",
+            SortKey::CacheRead => "cache read",
+            SortKey::CacheWrite => "cache write",
+            SortKey::Name => "name",
+        };
+        let order = match self.catalog_sort_order {
+            SortOrder::Ascending => "asc",
+            SortOrder::Descending => "desc",
+        };
+        match self.catalog_sort_key {
+            SortKey::Name => format!("{key} {order} · unknown last"),
+            SortKey::Output => format!("highest published {key} {order} · unknown last"),
+            _ => format!("default {key} {order} · unknown last"),
         }
     }
     fn selected_session(&self) -> Option<String> {
@@ -265,6 +364,57 @@ impl App {
                 return Action::None;
             }
         }
+        if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            let step = height.saturating_sub(12).max(1);
+            let maximum = if self.tab == 5 {
+                self.catalog
+                    .as_ref()
+                    .and_then(|models| {
+                        models.get(self.catalog_selected).map(|model| {
+                            catalog_ui::detail_line_count(
+                                model,
+                                self.summary.as_ref(),
+                                models,
+                                width,
+                                self.exact_counts,
+                            )
+                        })
+                    })
+                    .unwrap_or(0)
+            } else if self.tab == 2 && self.show_model_detail {
+                self.summary
+                    .as_ref()
+                    .and_then(|v| v.get("byModel"))
+                    .and_then(Value::as_array)
+                    .and_then(|rows| rows.get(self.model_offset))
+                    .map(|usage| {
+                        catalog_ui::usage_detail_line_count(
+                            usage,
+                            self.catalog.as_deref(),
+                            width,
+                            self.exact_counts,
+                        )
+                    })
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if maximum > 0 {
+                let scroll = if self.tab == 5 {
+                    &mut self.catalog_detail_scroll
+                } else {
+                    &mut self.model_detail_scroll
+                };
+                *scroll = match key.code {
+                    KeyCode::PageUp => scroll.saturating_sub(step),
+                    KeyCode::PageDown => scroll
+                        .saturating_add(step)
+                        .min(u16::try_from(maximum.saturating_sub(1)).unwrap_or(u16::MAX)),
+                    _ => *scroll,
+                };
+                return Action::None;
+            }
+        }
         self.key(key)
     }
     fn key(&mut self, key: KeyEvent) -> Action {
@@ -288,6 +438,12 @@ impl App {
                 _ => Action::None,
             };
         }
+        if self.tab == 2 && self.show_model_detail && key.code == KeyCode::Esc {
+            self.show_model_detail = false;
+            self.model_detail_scroll = 0;
+            self.selected_model_id = None;
+            return Action::None;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
             KeyCode::Char('1') => {
@@ -310,12 +466,16 @@ impl App {
                 self.tab = 4;
                 Action::None
             }
+            KeyCode::Char('6') => {
+                self.tab = 5;
+                Action::None
+            }
             KeyCode::Tab => {
-                self.tab = (self.tab + 1) % 5;
+                self.tab = (self.tab + 1) % 6;
                 Action::None
             }
             KeyCode::BackTab => {
-                self.tab = (self.tab + 4) % 5;
+                self.tab = (self.tab + 5) % 6;
                 Action::None
             }
             KeyCode::Char('p') => {
@@ -357,6 +517,47 @@ impl App {
                 self.detail_scroll = 0;
                 Action::None
             }
+            KeyCode::Char('d') if self.tab == 2 => {
+                if self.show_model_detail {
+                    self.show_model_detail = false;
+                    self.selected_model_id = None;
+                } else if let Some(model) = self
+                    .summary
+                    .as_ref()
+                    .and_then(|v| v.get("byModel"))
+                    .and_then(Value::as_array)
+                    .and_then(|rows| rows.get(self.model_offset))
+                {
+                    self.show_model_detail = true;
+                    self.selected_model_id = model
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                self.model_detail_scroll = 0;
+                Action::None
+            }
+            KeyCode::Char('s') if self.tab == 5 => {
+                self.catalog_sort_key = match self.catalog_sort_key {
+                    SortKey::Output => SortKey::Input,
+                    SortKey::Input => SortKey::CacheRead,
+                    SortKey::CacheRead => SortKey::CacheWrite,
+                    SortKey::CacheWrite => SortKey::Name,
+                    SortKey::Name => SortKey::Output,
+                };
+                self.sort_catalog();
+                self.catalog_selected = 0;
+                Action::None
+            }
+            KeyCode::Char('o') if self.tab == 5 => {
+                self.catalog_sort_order = match self.catalog_sort_order {
+                    SortOrder::Descending => SortOrder::Ascending,
+                    SortOrder::Ascending => SortOrder::Descending,
+                };
+                self.sort_catalog();
+                self.catalog_selected = 0;
+                Action::None
+            }
             KeyCode::Char(' ') => {
                 self.paused = !self.paused;
                 if self.paused {
@@ -365,7 +566,7 @@ impl App {
                     Action::Both
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') if self.tab == 2 => {
+            KeyCode::Up | KeyCode::Char('k') if self.tab == 2 && !self.show_model_detail => {
                 self.model_offset = self.model_offset.saturating_sub(1);
                 Action::None
             }
@@ -424,7 +625,7 @@ impl App {
                 }
                 Action::None
             }
-            KeyCode::Down | KeyCode::Char('j') if self.tab == 2 => {
+            KeyCode::Down | KeyCode::Char('j') if self.tab == 2 && !self.show_model_detail => {
                 let count = self
                     .summary
                     .as_ref()
@@ -434,6 +635,34 @@ impl App {
                     .unwrap_or(0);
                 if self.model_offset + 1 < count {
                     self.model_offset += 1;
+                }
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.tab == 5 => {
+                self.catalog_selected = self.catalog_selected.saturating_sub(1);
+                self.catalog_detail_scroll = 0;
+                Action::None
+            }
+            KeyCode::Home if self.tab == 5 => {
+                self.catalog_selected = 0;
+                self.catalog_detail_scroll = 0;
+                Action::None
+            }
+            KeyCode::End if self.tab == 5 => {
+                self.catalog_selected = self
+                    .catalog
+                    .as_ref()
+                    .map(Vec::len)
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                self.catalog_detail_scroll = 0;
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.tab == 5 => {
+                let count = self.catalog.as_ref().map(Vec::len).unwrap_or(0);
+                if self.catalog_selected + 1 < count {
+                    self.catalog_selected += 1;
+                    self.catalog_detail_scroll = 0;
                 }
                 Action::None
             }
@@ -510,6 +739,7 @@ enum Update {
         result: Box<UsageSnapshot>,
     },
     Quota(std::result::Result<Value, String>),
+    Catalog(std::result::Result<Value, String>),
 }
 
 fn launch_usage(
@@ -554,6 +784,15 @@ fn launch_quota(client: &MonitorClient, tx: &mpsc::Sender<Update>, tasks: &mut J
     });
 }
 
+fn launch_catalog(client: &MonitorClient, tx: &mpsc::Sender<Update>, tasks: &mut JoinSet<()>) {
+    let client = client.clone();
+    let tx = tx.clone();
+    tasks.spawn(async move {
+        let result = client.fetch_models().await;
+        let _ = tx.send(Update::Catalog(result)).await;
+    });
+}
+
 /// Run a read-only dashboard while the caller owns the server lifecycle.
 pub async fn run(
     endpoint: &str,
@@ -573,12 +812,16 @@ pub async fn run(
     let mut tasks = JoinSet::new();
     let mut usage_pending = false;
     let mut quota_pending = false;
+    let mut catalog_pending = false;
     let mut usage_requeue = false;
     let mut quota_requeue = false;
+    let mut catalog_requeue = false;
     let mut usage_interval = tokio::time::interval(Duration::from_secs(5));
     let mut quota_interval = tokio::time::interval(Duration::from_secs(60));
+    let mut catalog_interval = tokio::time::interval(Duration::from_secs(60));
     usage_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     quota_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    catalog_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     #[cfg(unix)]
@@ -601,10 +844,27 @@ pub async fn run(
             .notice
             .clone()
             .unwrap_or_else(|| format!("server running · quota {quota_age}"));
+        let catalog_status = match (&app.catalog_error, app.catalog_updated) {
+            (Some(error), _) => format!(
+                "{error} · price reference {}",
+                pricing_reference::reference_status()
+            ),
+            (None, Some(updated)) => format!(
+                "updated {}s ago · price reference {}",
+                updated.elapsed().as_secs(),
+                pricing_reference::reference_status()
+            ),
+            (None, None) => format!(
+                "loading · price reference {}",
+                pricing_reference::reference_status()
+            ),
+        };
+        let catalog_sort_label = app.catalog_sort_label();
         let error = app
             .usage_error
             .clone()
             .or_else(|| app.quota_error.clone())
+            .or_else(|| app.catalog_error.clone())
             .or_else(|| logs.latest());
         screen.terminal.draw(|frame| {
             ui::render(
@@ -623,6 +883,14 @@ pub async fn run(
                     status: &status,
                     page: app.page,
                     model_offset: app.model_offset,
+                    catalog: app.catalog.as_deref(),
+                    show_model_detail: app.show_model_detail,
+                    model_detail_scroll: app.model_detail_scroll,
+                    catalog_selected: app.catalog_selected,
+                    catalog_sort_label: &catalog_sort_label,
+                    catalog_sort_key: app.catalog_sort_key,
+                    catalog_detail_scroll: app.catalog_detail_scroll,
+                    catalog_status: &catalog_status,
                     event_offset: app.event_offset,
                     session_page: app.session_page,
                     session_offset: app.session_offset,
@@ -655,10 +923,12 @@ pub async fn run(
                 }
                 if action == Action::Both {
                     if quota_pending { quota_requeue = true; } else { launch_quota(&client, &tx, &mut tasks); quota_pending = true; }
+                    if catalog_pending { catalog_requeue = true; } else { launch_catalog(&client, &tx, &mut tasks); catalog_pending = true; }
                 }
             }
             _ = usage_interval.tick() => if !app.paused && !usage_pending { launch_usage(&client, &app, &tx, &mut tasks); usage_pending = true; },
             _ = quota_interval.tick() => if !app.paused && !quota_pending { launch_quota(&client, &tx, &mut tasks); quota_pending = true; },
+            _ = catalog_interval.tick() => if !app.paused && !catalog_pending { launch_catalog(&client, &tx, &mut tasks); catalog_pending = true; },
             Some(update) = rx.recv() => match update {
                 Update::Usage { period, page, session_page, selected_session, result } => {
                     usage_pending = false;
@@ -672,9 +942,13 @@ pub async fn run(
                     quota_pending = false; app.apply_quota(result);
                     if quota_requeue { quota_requeue = false; launch_quota(&client, &tx, &mut tasks); quota_pending = true; }
                 },
+                Update::Catalog(result) => {
+                    catalog_pending = false; app.apply_catalog(result);
+                    if catalog_requeue { catalog_requeue = false; launch_catalog(&client, &tx, &mut tasks); catalog_pending = true; }
+                },
             },
             Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
-                if joined.is_err() { app.usage_error = Some("Monitoring task failed".into()); usage_pending = false; quota_pending = false; }
+                if joined.is_err() { app.usage_error = Some("Monitoring task failed".into()); usage_pending = false; quota_pending = false; catalog_pending = false; }
             },
             result = &mut *server => return match result { Ok(Ok(())) => Err(anyhow::anyhow!("server stopped unexpectedly")), Ok(Err(error)) => Err(error).context("server failed"), Err(error) => Err(error).context("server task failed") },
             _ = &mut termination => break,
@@ -909,7 +1183,87 @@ mod tests {
         assert!(app.session_rates.is_none());
         app.key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
         app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.tab, 5);
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.tab, 0);
+    }
+
+    #[test]
+    fn catalog_sort_controls_preserve_selection_and_hide_unknown_prices() {
+        use catalog::{PriceTier, VerifiedQuote};
+        let model = |id: &str, input: Option<f64>, output: Option<f64>| CatalogModel {
+            id: id.into(),
+            name: id.into(),
+            default_prices: Some(PriceTier {
+                verified: Some(VerifiedQuote {
+                    input,
+                    output,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut app = App {
+            tab: 5,
+            catalog: Some(vec![
+                model("low", Some(1.0), Some(2.0)),
+                model("high", Some(4.0), Some(10.0)),
+                model("unknown", None, None),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            app.catalog_sort_label(),
+            "highest published output desc · unknown last"
+        );
+        app.sort_catalog();
+        assert_eq!(app.catalog.as_ref().unwrap()[0].id, "high");
+        // The pre-sort selection remains the same ID.
+        assert_eq!(
+            app.catalog.as_ref().unwrap()[app.catalog_selected].id,
+            "low"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.catalog_sort_key, SortKey::Input);
+        assert_eq!(app.catalog_selected, 0);
+        app.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert_eq!(app.catalog_sort_order, SortOrder::Ascending);
+        let ids: Vec<_> = app
+            .catalog
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(ids, ["low", "high", "unknown"]);
+        app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.catalog_selected, 2);
+        app.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.catalog_selected, 0);
+        app.apply_catalog(Err("offline".into()));
+        assert_eq!(app.catalog.as_ref().unwrap().len(), 3);
+        assert!(app.catalog_error.as_deref().unwrap().contains("offline"));
+        assert!(app.key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE)) == Action::None);
+        assert_eq!(app.tab, 5);
+    }
+
+    #[test]
+    fn model_pricing_detail_returns_without_quitting() {
+        let mut app = App {
+            tab: 2,
+            summary: Some(
+                serde_json::json!({"byModel":[{"model":"example","total_nano_aiu":123}]}),
+            ),
+            ..Default::default()
+        };
+        assert!(app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)) == Action::None);
+        assert!(app.show_model_detail);
+        assert_eq!(app.selected_model_id.as_deref(), Some("example"));
+        app.key_in_terminal(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), 80, 24);
+        assert!(app.model_detail_scroll > 0);
+        assert!(app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)) == Action::None);
+        assert!(!app.show_model_detail);
     }
 
     #[tokio::test]
@@ -929,9 +1283,11 @@ mod tests {
         let mut tasks = JoinSet::new();
         launch_usage(&client, &app, &tx, &mut tasks);
         launch_quota(&client, &tx, &mut tasks);
+        launch_catalog(&client, &tx, &mut tasks);
         let mut saw_usage = false;
         let mut saw_quota = false;
-        for _ in 0..2 {
+        let mut saw_catalog = false;
+        for _ in 0..3 {
             match tokio::time::timeout(Duration::from_secs(3), rx.recv())
                 .await
                 .unwrap()
@@ -951,9 +1307,13 @@ mod tests {
                     assert!(result.is_ok());
                     saw_quota = true;
                 }
+                Update::Catalog(result) => {
+                    assert!(result.is_ok());
+                    saw_catalog = true;
+                }
             }
         }
-        assert!(saw_usage && saw_quota);
+        assert!(saw_usage && saw_quota && saw_catalog);
         while tasks.join_next().await.is_some() {}
         server.abort();
     }

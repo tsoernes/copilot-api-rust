@@ -1,4 +1,8 @@
 //! Presentation only: input, refresh and networking are owned by the caller.
+use super::{
+    catalog::{CatalogModel, SortKey},
+    catalog_ui,
+};
 use chrono::{Local, TimeZone};
 use ratatui::{
     Frame,
@@ -23,6 +27,14 @@ pub struct View<'a> {
     pub status: &'a str,
     pub page: usize,
     pub model_offset: usize,
+    pub catalog: Option<&'a [CatalogModel]>,
+    pub show_model_detail: bool,
+    pub model_detail_scroll: u16,
+    pub catalog_selected: usize,
+    pub catalog_sort_label: &'a str,
+    pub catalog_sort_key: SortKey,
+    pub catalog_detail_scroll: u16,
+    pub catalog_status: &'a str,
     pub event_offset: usize,
     pub session_page: usize,
     pub session_offset: usize,
@@ -347,11 +359,18 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         clean(view.last_updated)
     )));
     frame.render_widget(Paragraph::new(header), parts[0]);
-    let tab = view.tab.min(4);
+    let tab = view.tab.min(5);
     let labels = if area.width < 48 {
-        ["1:O", "2:Q", "3:M", "4:R", "5:S"]
+        ["1:O", "2:Q", "3:M", "4:R", "5:S", "6:A"]
     } else {
-        ["Overview", "Quota", "Models", "Requests", "Sessions"]
+        [
+            "Overview",
+            "Quota",
+            "Models",
+            "Requests",
+            "Sessions",
+            "Available",
+        ]
     };
     frame.render_widget(
         Tabs::new(labels)
@@ -366,16 +385,36 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         1 => quota(frame, parts[2], view),
         2 => models(frame, parts[2], view),
         3 => events(frame, parts[2], view),
-        _ => sessions(frame, parts[2], view),
+        4 => sessions(frame, parts[2], view),
+        _ => catalog_ui::render(
+            frame,
+            parts[2],
+            &catalog_ui::CatalogView {
+                models: view.catalog,
+                summary: view.summary,
+                selected: view.catalog_selected,
+                sort_label: view.catalog_sort_label,
+                sort_key: view.catalog_sort_key,
+                detail_scroll: view.catalog_detail_scroll,
+                status: view.catalog_status,
+                exact_counts: view.exact_counts,
+            },
+        ),
     }
     let controls = if view.tab == 1 {
-        " 1–5 Tab  u units  b billing settings  p period  r refresh  space pause  q quit"
+        " 1–6 Tab  u units  b billing settings  p period  r refresh  space pause  q quit"
+    } else if view.tab == 5 {
+        " s sort  o order  u units  ↑/↓ model  Home/End  PgUp/PgDn details  r refresh  q quit"
+    } else if view.tab == 2 && view.show_model_detail {
+        " PgUp/PgDn scroll  d return  u units  q quit"
+    } else if view.tab == 2 {
+        " d pricing  ↑/↓ model  u units  p period  r refresh  q quit"
     } else if view.tab == 3 && view.show_event_detail {
         " ↑/↓ detail  u units  d return  ←/→ page  p period  r refresh  q quit"
     } else if view.tab == 3 {
-        " 1–5 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  d detail  q quit"
+        " 1–6 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  d detail  q quit"
     } else {
-        " 1–5 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit"
+        " 1–6 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit"
     };
     let footer = if let Some(error) = view.error {
         vec![
@@ -697,6 +736,17 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         return;
     }
     let offset = view.model_offset.min(rows.len().saturating_sub(1));
+    if view.show_model_detail {
+        catalog_ui::render_usage_details(
+            frame,
+            area,
+            &rows[offset],
+            view.catalog,
+            view.model_detail_scroll,
+            view.exact_counts,
+        );
+        return;
+    }
     let columns = [
         ("Requests", "request_count"),
         ("Input", "input_tokens"),
@@ -722,6 +772,18 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         .max()
         .unwrap_or(0)
         .max("Est. cost".len());
+    let ref_width = rows
+        .iter()
+        .map(|m| catalog_ui::reference_output(view.catalog, m).len())
+        .max()
+        .unwrap_or(0)
+        .max("GH default out cr/1M".len());
+    let aiu_width = rows
+        .iter()
+        .map(|m| catalog_ui::aiu(m.get("total_nano_aiu")).len())
+        .max()
+        .unwrap_or(0)
+        .max("AIU (partial?)".len());
     let ttft_width = rows
         .iter()
         .map(|m| decimal(m.get("average_first_token_ms")).len())
@@ -734,8 +796,15 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         .max()
         .unwrap_or(0)
         .max("Output tok/s".len());
-    let required =
-        12usize + widths.iter().sum::<usize>() + cost_width + ttft_width + speed_width + 9 + 2;
+    let required = 12usize
+        + widths.iter().sum::<usize>()
+        + cost_width
+        + ref_width
+        + aiu_width
+        + ttft_width
+        + speed_width
+        + 11
+        + 2;
     let wide = usize::from(area.width) >= required;
     let visible = if wide {
         usize::from(area.height.saturating_sub(3))
@@ -747,7 +816,7 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         "Model breakdown".into()
     } else {
         format!(
-            "Model breakdown · {}–{} / {}",
+            "Model breakdown · {}–{} / {} · d pricing",
             offset + 1,
             offset + shown,
             rows.len()
@@ -756,20 +825,45 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     if !wide {
         let model = &rows[offset];
         let mut lines = vec![format!("Model: {}", text(model, "model"))];
-        lines.extend(
-            columns.iter().map(|(label, key)| {
+        if area.width >= 80 {
+            for pair in columns.chunks(2) {
+                lines.push(
+                    pair.iter()
+                        .map(|(label, key)| {
+                            format!("{label}: {}", count(model.get(*key), view.exact_counts))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("    "),
+                );
+            }
+        } else {
+            lines.extend(columns.iter().map(|(label, key)| {
                 format!("{label}: {}", count(model.get(*key), view.exact_counts))
-            }),
-        );
+            }));
+        }
         lines.push(format!("Estimated cost: {}", cost(model)));
-        lines.push(format!(
+        let price = format!(
+            "GH default out cr/1M: {}",
+            catalog_ui::reference_output(view.catalog, model)
+        );
+        let aiu = format!(
+            "AIU (partial?): {}",
+            catalog_ui::aiu(model.get("total_nano_aiu"))
+        );
+        let timing = format!(
             "Avg TTFT ms: {}",
             decimal(model.get("average_first_token_ms"))
-        ));
-        lines.push(format!(
+        );
+        let speed = format!(
             "Output tok/s: {}",
             decimal(model.get("output_tokens_per_second"))
-        ));
+        );
+        if area.width >= 80 {
+            lines.push(format!("{price}    {aiu}"));
+            lines.push(format!("{timing}    {speed}"));
+        } else {
+            lines.extend([price, aiu, timing, speed]);
+        }
         let lines = wrap_physical_lines(lines, usize::from(area.width.saturating_sub(2)));
         if lines.len() > usize::from(area.height.saturating_sub(2)) {
             frame.render_widget(
@@ -804,6 +898,8 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
                     .map(|(_, key)| Cell::from(count(m.get(*key), view.exact_counts))),
             );
             cells.push(Cell::from(cost(m)));
+            cells.push(Cell::from(catalog_ui::reference_output(view.catalog, m)));
+            cells.push(Cell::from(catalog_ui::aiu(m.get("total_nano_aiu"))));
             cells.push(Cell::from(decimal(m.get("average_first_token_ms"))));
             cells.push(Cell::from(decimal(m.get("output_tokens_per_second"))));
             Row::new(cells).style(if index == 0 {
@@ -819,7 +915,7 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             .map(|w| Constraint::Length(u16::try_from(*w).unwrap_or(u16::MAX))),
     );
     constraints.extend(
-        [cost_width, ttft_width, speed_width]
+        [cost_width, ref_width, aiu_width, ttft_width, speed_width]
             .into_iter()
             .map(|w| Constraint::Length(u16::try_from(w).unwrap_or(u16::MAX))),
     );
@@ -834,6 +930,8 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
                 "Cache write",
                 "Total",
                 "Est. cost",
+                "GH default out cr/1M",
+                "AIU (partial?)",
                 "Avg TTFT ms",
                 "Output tok/s",
             ])
@@ -1291,6 +1389,7 @@ fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::catalog::{PriceTier, VerifiedQuote};
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
@@ -1315,6 +1414,14 @@ mod tests {
             status: "ok",
             page: 1,
             model_offset: 0,
+            catalog: None,
+            show_model_detail: false,
+            model_detail_scroll: 0,
+            catalog_selected: 0,
+            catalog_sort_label: "output desc",
+            catalog_sort_key: SortKey::Output,
+            catalog_detail_scroll: 0,
+            catalog_status: "ok",
             event_offset: 0,
             session_page: 1,
             session_offset: 0,
@@ -1455,6 +1562,109 @@ mod tests {
         let mut short = Terminal::new(TestBackend::new(42, 12)).unwrap();
         short.draw(|f| render(f, &v)).unwrap();
         assert!(render_text(&short).contains("Resize taller"));
+    }
+
+    #[test]
+    fn model_prices_and_spend_are_distinct_and_exactly_joined() {
+        let null = Value::Null;
+        let summary = json!({"byModel":[
+            {"model":"model-a","total_nano_aiu":1,"costs":[{"currency":"USD","amount":0.01}]},
+            {"model":"model-b","total_nano_aiu":null,"costs":[]}
+        ]});
+        let catalog = vec![CatalogModel {
+            id: "model-a".into(),
+            default_prices: Some(PriceTier {
+                verified: Some(VerifiedQuote {
+                    input: Some(2.0),
+                    output: Some(10.0),
+                    cache_read: Some(0.5),
+                    cache_write: Some(3.0),
+                    source: "GitHub reference 2026-11-20; promo applies".into(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let mut v = view(&summary, &null, &null, &null);
+        v.tab = 2;
+        v.catalog = Some(&catalog);
+        for (width, height) in [(178, 46), (80, 24), (42, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| render(f, &v)).unwrap();
+            let display = render_text(&terminal);
+            for value in [
+                "model-a",
+                "cr/1M",
+                "AIU (partial?)",
+                "0.000000001",
+                "USD 0.0100",
+            ] {
+                assert!(
+                    display.contains(value),
+                    "missing {value} at {width}x{height}: {display}"
+                );
+            }
+            v.show_model_detail = true;
+            let mut seen = String::new();
+            let count = catalog_ui::usage_detail_line_count(
+                &summary["byModel"][0],
+                Some(&catalog),
+                width,
+                v.exact_counts,
+            );
+            for scroll in 0..count {
+                v.model_detail_scroll = scroll as u16;
+                terminal.draw(|f| render(f, &v)).unwrap();
+                seen.push_str(&render_text(&terminal));
+            }
+            for value in [
+                "0.000000001",
+                "reference credits",
+                "output 10",
+                "cache read 0.5",
+                "GitHub reference",
+            ] {
+                assert!(
+                    seen.contains(value),
+                    "missing {value} at {width}x{height}: {seen}"
+                );
+            }
+            v.show_model_detail = false;
+            v.model_detail_scroll = 0;
+        }
+        assert_eq!(
+            catalog_ui::reference_output(Some(&catalog), &summary["byModel"][1]),
+            "—"
+        );
+        assert_eq!(
+            catalog_ui::reference_output(None, &summary["byModel"][0]),
+            "—"
+        );
+        let duplicate = vec![catalog[0].clone(), catalog[0].clone()];
+        assert_eq!(
+            catalog_ui::reference_output(Some(&duplicate), &summary["byModel"][0]),
+            "—"
+        );
+    }
+
+    #[test]
+    fn sixth_tab_displays_catalog_and_its_controls() {
+        let null = Value::Null;
+        let catalog = [CatalogModel {
+            id: "available-model".into(),
+            ..Default::default()
+        }];
+        let mut v = view(&null, &null, &null, &null);
+        v.tab = 5;
+        v.catalog = Some(&catalog);
+        for (width, height) in [(178, 46), (80, 24), (42, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| render(f, &v)).unwrap();
+            let display = render_text(&terminal);
+            for expected in ["available-model", "s sort", "o order"] {
+                assert!(display.contains(expected), "{width}x{height}: {display}");
+            }
+        }
     }
 
     #[test]

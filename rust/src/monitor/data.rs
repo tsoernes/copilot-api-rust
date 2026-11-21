@@ -152,6 +152,11 @@ impl MonitorClient {
         self.fetch("usage/github-copilot", &[]).await
     }
 
+    /// Fetch account-specific Copilot model metadata through the local gateway.
+    pub async fn fetch_models(&self) -> Result<Value, String> {
+        self.fetch("models", &[]).await
+    }
+
     async fn fetch(&self, path: &str, params: &[(&str, &str)]) -> Result<Value, String> {
         // `path` is an internal static string, not an external URL.
         let mut url = self.base.clone();
@@ -321,6 +326,7 @@ mod tests {
             client.fetch_quota().await.unwrap()["path"],
             "/usage/github-copilot"
         );
+        assert_eq!(client.fetch_models().await.unwrap()["path"], "/models");
         assert!(
             client
                 .fetch_usage("bad", 1, 1, 20, None)
