@@ -30,7 +30,7 @@
 
 ## Implementation notes (not user requirements)
 
-- The fork starts from upstream commit `350dc3d992faa9f539bd9b81de14cf036477c377` (version 2.9.16); the upstream MIT license and history are retained. The only gateway implementation in the repository is the Rust project under `rust/`; non-Rust source, desktop, plugin and build projects were removed as requested. This remains a limited-scope compatibility implementation, not a claim of full parity.
+- The Rust source is based on upstream commit `350dc3d992faa9f539bd9b81de14cf036477c377` (version 2.9.16), and the upstream MIT license is retained. The published history was rewritten to keep Rust-project changes and remove the original non-Rust project. The only gateway implementation in the repository is under `rust/`; non-Rust source, desktop, plugin and build projects were removed as requested. This remains a limited-scope compatibility implementation, not a claim of full parity.
 - Favor streaming responses and ordinary maintainable code. Request JSON is buffered for inspection/normalization without a gateway-level size cap, so large bodies can use substantial local RAM even though Copilot decides whether to accept them. Record compatibility and testing limitations in `rust/README.md` rather than claiming upstream parity.
 - Upstream includes multiple providers, desktop and plugin integrations, administration, OAuth, streaming translations and many routes. These are not automatically implemented by a Copilot-only proxy.
 - Automatic payer switching and retry remain unresolved: no documented payer-selection API was found, and replay after forwarding part of a stream is not transparent. Opening GitHub settings is a manual alternative, not completion of the automatic requirement.
