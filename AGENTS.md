@@ -22,7 +22,7 @@ Run focused Rust tests while iterating, then run the full suite before committin
 
 - Follow `rustfmt`, use explicit error handling, and keep request/response behavior covered by tests.
 - Avoid logging request bodies, authorization headers, GitHub tokens, or other credentials.
-- Keep network access, input sizes, and persistence bounded; document compatibility and memory tradeoffs honestly.
+- Do not impose a local request-size cap; forward valid oversized JSON so Copilot can decide. Requests are buffered for parsing, so avoid unnecessary copies and document the per-request RAM tradeoff. Bound other inputs and persistence as appropriate.
 - Never commit tokens, local credentials, build output, or user data.
 
 ## Commits
