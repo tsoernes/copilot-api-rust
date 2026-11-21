@@ -4,9 +4,9 @@
 
 ## Verification
 
-- [ ] `cargo fmt --manifest-path rust/Cargo.toml --check`
-- [ ] `cargo test --locked --manifest-path rust/Cargo.toml`
-- [ ] `cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings`
+- [ ] `cargo fmt --check`
+- [ ] `cargo test --locked`
+- [ ] `cargo clippy --locked --all-targets -- -D warnings`
 
 ## Compatibility and security
 

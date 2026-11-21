@@ -5,6 +5,7 @@
 - Create a Rust fork of <https://github.com/caozhiyuan/copilot-api>, commit incrementally, create a public GitHub fork, and push it. (User, 2026-11-20.)
 - Make the repository contain only the Rust version by removing the original non-Rust project, and clearly state that this implementation is compatible with only a limited scope of the original `copilot-api`. (User, 2026-11-21.)
 - Rewrite the published Git history so it contains only Rust-project history, not the original non-Rust project. (User, 2026-11-21.)
+- Place the Rust crate at the repository root instead of keeping it in a `rust/` subdirectory. (User, 2026-11-21.)
 - Consider low memory usage, but do not over-optimize. (User, 2026-11-20.)
 - Implement usage monitoring like the original project. (User, 2026-11-20.)
 - Implement GitHub sign-in if it is not already present. (User, 2026-11-20.)
@@ -32,8 +33,8 @@
 
 ## Implementation notes (not user requirements)
 
-- The Rust source is based on upstream commit `350dc3d992faa9f539bd9b81de14cf036477c377` (version 2.9.16), and the upstream MIT license is retained. The published history was rewritten to keep Rust-project changes and remove the original non-Rust project. The only gateway implementation in the repository is under `rust/`; non-Rust source, desktop, plugin and build projects were removed as requested. This remains a limited-scope compatibility implementation, not a claim of full parity.
-- Favor streaming responses and ordinary maintainable code. Request JSON is buffered for inspection/normalization without a gateway-level size cap, so large bodies can use substantial local RAM even though Copilot decides whether to accept them. Record compatibility and testing limitations in `rust/README.md` rather than claiming upstream parity.
+- The Rust source is based on upstream commit `350dc3d992faa9f539bd9b81de14cf036477c377` (version 2.9.16), and the upstream MIT license is retained. The published history was rewritten to keep Rust-project changes and remove the original non-Rust project. The only gateway implementation in the repository is the crate at the root; non-Rust source, desktop, plugin and build projects were removed as requested. This remains a limited-scope compatibility implementation, not a claim of full parity.
+- Favor streaming responses and ordinary maintainable code. Request JSON is buffered for inspection/normalization without a gateway-level size cap, so large bodies can use substantial local RAM even though Copilot decides whether to accept them. Record compatibility and testing limitations in `RUST_GUIDE.md` rather than claiming upstream parity.
 - Upstream includes multiple providers, desktop and plugin integrations, administration, OAuth, streaming translations and many routes. These are not automatically implemented by a Copilot-only proxy.
 - Automatic payer switching and retry remain unresolved: no documented payer-selection API was found, and replay after forwarding part of a stream is not transparent. Opening GitHub settings is a manual alternative, not completion of the automatic requirement.
 - Output sorting uses the highest independently verified published output price across available tiers and marks incomplete comparisons; the catalog also offers a dedicated long-context-output sort.

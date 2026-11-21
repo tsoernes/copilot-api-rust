@@ -4,10 +4,10 @@ A Rust implementation intended to be compatible with a **limited scope** of
 [`caozhiyuan/copilot-api`](https://github.com/caozhiyuan/copilot-api). It is not
 a complete port or a drop-in replacement: provider routing, many translations,
 WebSockets, administration, plugins, and desktop features are not implemented.
-See [the compatibility notes](rust/README.md#current-scope-and-known-gaps)
+See [the compatibility notes](RUST_GUIDE.md#current-scope-and-known-gaps)
 before using it.
 
-[![Overview of the Rust terminal monitor — synthetic sample data](rust/assets/screenshots/overview.png)](docs/monitor-gallery.md)
+[![Overview of the Rust terminal monitor — synthetic sample data](assets/screenshots/overview.png)](docs/monitor-gallery.md)
 
 [View the screenshot gallery of all six monitor panes](docs/monitor-gallery.md) · synthetic sample data
 
@@ -23,9 +23,9 @@ This is the basic Copilot-focused subset currently implemented; it does not prov
 ## Build and run
 
 ```fish
-cargo build --locked --release --manifest-path rust/Cargo.toml
-./rust/target/release/copilot-api-rust auth
-./rust/target/release/copilot-api-rust monitor
+cargo build --locked --release
+./target/release/copilot-api-rust auth
+./target/release/copilot-api-rust monitor
 ```
 
 The monitor starts the API server and terminal dashboard together. The server
@@ -48,5 +48,5 @@ gateway-level request-size cap, so Copilot decides whether valid JSON is too
 large; a large or concurrent request can still consume substantial local RAM.
 
 For all current usage, quota, catalog, security, and compatibility details, see
-the [Rust implementation guide](rust/README.md). User requirements and scope
+the [Rust implementation guide](RUST_GUIDE.md). User requirements and scope
 decisions are recorded in [the port specification](docs/RUST_PORT_SPEC.md).

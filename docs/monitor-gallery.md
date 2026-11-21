@@ -8,24 +8,24 @@ Overview, Models, and Sessions summarize 24 synthetic usage events. The Requests
 
 ## Overview
 
-![Overview pane showing synthetic request, token, cost, cache, rolling-window, and daily-token figures](../rust/assets/screenshots/overview.png)
+![Overview pane showing synthetic request, token, cost, cache, rolling-window, and daily-token figures](../assets/screenshots/overview.png)
 
 ## Quota
 
-![Quota pane with synthetic premium-request allowance, remaining amount, and reset information](../rust/assets/screenshots/quota.png)
+![Quota pane with synthetic premium-request allowance, remaining amount, and reset information](../assets/screenshots/quota.png)
 
 ## Models
 
-![Models pane showing synthetic per-model token counts, costs, and timing](../rust/assets/screenshots/models.png)
+![Models pane showing synthetic per-model token counts, costs, and timing](../assets/screenshots/models.png)
 
 ## Requests
 
-![Requests pane showing synthetic recent requests and token breakdowns](../rust/assets/screenshots/requests.png)
+![Requests pane showing synthetic recent requests and token breakdowns](../assets/screenshots/requests.png)
 
 ## Sessions
 
-![Sessions pane showing synthetic per-session request, token, cost, and rolling-rate totals](../rust/assets/screenshots/sessions.png)
+![Sessions pane showing synthetic per-session request, token, cost, and rolling-rate totals](../assets/screenshots/sessions.png)
 
 ## Catalog
 
-![Catalog pane showing synthetic model entries, reference-price details, and sort controls](../rust/assets/screenshots/catalog.png)
+![Catalog pane showing synthetic model entries, reference-price details, and sort controls](../assets/screenshots/catalog.png)

@@ -1,6 +1,5 @@
 # Rust build output
 /target/
-/rust/target/
 
 # Local credentials, environment and runtime data
 .env

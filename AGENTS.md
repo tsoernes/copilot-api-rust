@@ -2,7 +2,7 @@
 
 ## Scope
 
-- The implementation is the Rust gateway under `rust/`; the embedded usage viewer is a runtime asset.
+- The implementation is the Rust crate at the repository root (`src/`); the embedded usage viewer is a runtime asset under `assets/`.
 - Preserve the explicitly limited compatibility scope. Do not claim full parity with upstream `copilot-api`.
 - Update `docs/RUST_PORT_SPEC.md` when the user changes requirements. Keep user requirements distinct from implementation choices and open questions.
 
@@ -11,9 +11,9 @@
 Run from the repository root:
 
 ```fish
-cargo fmt --manifest-path rust/Cargo.toml --check
-cargo test --locked --manifest-path rust/Cargo.toml
-cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
 Run focused Rust tests while iterating, then run the full suite before committing behavior changes. For documentation-only edits, inspect links and the diff; Rust tests are not required.

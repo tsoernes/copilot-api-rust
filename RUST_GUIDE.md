@@ -6,14 +6,14 @@ upstream commit `350dc3d992faa9f539bd9b81de14cf036477c377` (2.9.16). The origina
 non-Rust implementation is not part of this repository's current source tree.
 This is not a complete port or a drop-in replacement; see
 [Current scope and known gaps](#current-scope-and-known-gaps). The upstream
-[MIT license](../LICENSE) and relevant [notices](../NOTICE.md) are retained.
+[MIT license](LICENSE) and relevant [notices](NOTICE.md) are retained.
 
 ## Build and run
 
 ```fish
-cargo build --locked --release --manifest-path rust/Cargo.toml
-./rust/target/release/copilot-api-rust auth
-./rust/target/release/copilot-api-rust serve
+cargo build --locked --release
+./target/release/copilot-api-rust auth
+./target/release/copilot-api-rust serve
 ```
 
 `auth` uses the GitHub device flow and saves the GitHub token with owner-only permissions on Unix. Alternatively set `COPILOT_API_GITHUB_TOKEN`; existing upstream credential files are read, and `COPILOT_API_HOME` can select the data directory. An active Copilot entitlement is required. Do not share token files or logs.
@@ -22,7 +22,7 @@ The server defaults to `127.0.0.1:4141`. Configure `COPILOT_API_KEY` to require 
 
 ## Terminal monitor
 
-After signing in, run `./rust/target/release/copilot-api-rust monitor` in an interactive terminal. This starts its own server and dashboard together; quitting the dashboard also stops that server. Use `--listen` and `COPILOT_API_KEY` as with `serve`; the monitor connects locally to its own listener, so it accepts loopback or wildcard listen addresses. The existing `serve` command runs without a TUI. Recent server errors are shown in the dashboard instead of being printed over it.
+After signing in, run `./target/release/copilot-api-rust monitor` in an interactive terminal. This starts its own server and dashboard together; quitting the dashboard also stops that server. Use `--listen` and `COPILOT_API_KEY` as with `serve`; the monitor connects locally to its own listener, so it accepts loopback or wildcard listen addresses. The existing `serve` command runs without a TUI. Recent server errors are shown in the dashboard instead of being printed over it.
 
 - `1`–`6` or Tab: overview, Copilot quota, per-model usage, recent requests, sessions and the available-model catalog.
 - `p`: change period; `↑`/`↓` or `j`/`k`: select/scroll models, requests or sessions; `←`/`→`: change request/session page. In Requests, `d` opens or closes the selected request's detailed token breakdown; scroll within it with `↑`/`↓`.
@@ -70,9 +70,9 @@ The original multi-provider/admin usage, key isolation, external history import,
 ## Development
 
 ```fish
-cargo fmt --manifest-path rust/Cargo.toml --check
-cargo test --locked --manifest-path rust/Cargo.toml
-cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
-User-specified requirements and baseline are recorded in [the port specification](../docs/RUST_PORT_SPEC.md).
+User-specified requirements and baseline are recorded in [the port specification](docs/RUST_PORT_SPEC.md).
