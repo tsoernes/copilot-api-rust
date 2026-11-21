@@ -11,6 +11,15 @@ before using it.
 
 [View the screenshot gallery of all six monitor panes](docs/monitor-gallery.md) · synthetic sample data
 
+## What this provides from Copilot API
+
+- GitHub Copilot device sign-in, token reuse, and token refresh.
+- A basic proxy for `/models`, `/chat/completions`, `/embeddings`, and `/responses`, with `/v1` aliases, plus native `/v1/messages` pass-through. Upstream status codes and bodies are forwarded; response and SSE bodies are streamed. Model/route support depends on Copilot.
+- Local usage monitoring through both an HTTP viewer and a terminal dashboard. The monitor includes request, token, model, session, quota, and catalog views; reported usage is stored locally in SQLite and cost figures are estimates, not bills.
+- A model catalog fetched from Copilot’s `/models` endpoint, with name filtering, price sorting, and separately identified GitHub reference prices.
+
+This is the basic Copilot-focused subset currently implemented; it does not provide the original project's complete feature set.
+
 ## Build and run
 
 ```fish
@@ -25,13 +34,18 @@ in the user data directory; alternatively set `COPILOT_API_GITHUB_TOKEN`.
 An active GitHub Copilot entitlement is required. Protect credentials and
 usage data; do not expose the service to an untrusted network.
 
-The API currently provides `/models`, `/chat/completions`, `/embeddings`,
-`/responses` and `/v1` aliases, plus native `/v1/messages`. There is no
-gateway-level request-size cap: valid JSON is buffered for inspection and then
-forwarded, allowing Copilot to decide whether it is too large. Large requests
-can therefore consume substantial local RAM. Individual models may not support
-every route. The bundled HTTP usage viewer and terminal monitor cover the Rust
-server's reported usage only.
+## Why Rust, and memory use
+
+Rust was chosen partly to explore lower runtime overhead, tighter control of
+allocations, and a compiled executable that does not require a Node.js or Bun
+runtime. This is a motivation, not a measured result: no comparative memory
+benchmark has established that this implementation uses less RAM than the
+original.
+
+Responses are streamed instead of collected into one buffer. Request JSON is
+still buffered, parsed, and normalized before forwarding. There is no
+gateway-level request-size cap, so Copilot decides whether valid JSON is too
+large; a large or concurrent request can still consume substantial local RAM.
 
 For all current usage, quota, catalog, security, and compatibility details, see
 the [Rust implementation guide](rust/README.md). User requirements and scope
