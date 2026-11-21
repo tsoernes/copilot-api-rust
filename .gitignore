@@ -1,0 +1,15 @@
+# Rust build output
+/target/
+/rust/target/
+
+# Local credentials, environment and runtime data
+.env
+.env.*
+*.local
+/data/
+/copilot-data/
+
+# Local editor state
+.DS_Store
+.serena/
+.vscode/
