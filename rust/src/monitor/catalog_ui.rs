@@ -473,7 +473,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &CatalogView<'_>) 
     let Some(models) = view.models else {
         frame.render_widget(
             Paragraph::new(format!("Catalog unavailable: {}", clean(view.status)))
-                .block(panel("Available models")),
+                .block(panel("Catalog")),
             area,
         );
         return;
@@ -485,14 +485,14 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &CatalogView<'_>) 
             } else {
                 "No models match this filter."
             })
-            .block(panel("Available models")),
+            .block(panel("Catalog")),
             area,
         );
         return;
     }
     if area.height < 7 || area.width < 20 {
         frame.render_widget(
-            Paragraph::new("Resize to show available models.").block(panel("Available models")),
+            Paragraph::new("Resize to show catalog models.").block(panel("Catalog")),
             area,
         );
         return;
@@ -503,7 +503,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &CatalogView<'_>) 
         Layout::vertical([Constraint::Length(list_height), Constraint::Min(3)]).split(area);
     let visible = usize::from(sections[0].height.saturating_sub(4));
     let start = selected.saturating_sub(visible.saturating_sub(1));
-    let title = format!("Available models · {} / {}", selected + 1, models.len());
+    let title = format!("Catalog · {} / {}", selected + 1, models.len());
     let metric = match view.sort_key {
         SortKey::Input => "Input: GitHub ref credits/1M",
         SortKey::Output | SortKey::Name => "Max published output cr/1M (* partial)",
