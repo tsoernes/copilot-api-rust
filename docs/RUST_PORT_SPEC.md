@@ -16,11 +16,12 @@
 - If supported, provide optional automatic billing-account switching when a stream reports monthly quota exhaustion. It must be off by default, restricted to a user-selected ordered allowlist, and automatically retry the failed request once after switching. (User, 2026-11-20.)
 - Display token and other count quantities using thousands/millions-style units (K, M, etc.). (User, 2026-11-20.)
 - Add rolling 7-day and 30-day counters to the terminal monitor. (User, 2026-11-20.)
-- The Models pane should show both per-token model unit prices and credits/AIU spent. Add a separate pane listing all Copilot-provided models and their information, with optional price sorting. Default to output price highest first and keep missing or unverified prices visible last; offer other sort orders. (User, 2026-11-20.)
+- The Models pane should show both per-token model unit prices and credits/AIU spent. Add a separate pane listing all Copilot-provided models and their information, with optional price sorting. Default to the highest available output-tier price first and keep missing or unverified prices visible last; offer other sort orders. (User, 2026-11-20; tier clarified 2026-11-21.)
 
 ## Open questions
 
 - Should compact counts be the default with an exact-count toggle, always remain exact with suffixes, or be compact only? (Asked 2026-11-20.)
+- If a model has verified prices for only some tiers, should sorting use its highest verified tier with a partial-comparison marker, or put it after fully verified models? (Asked 2026-11-21.)
 
 ## Implementation notes (not user requirements)
 
@@ -28,3 +29,4 @@
 - Favor streaming responses, bounded incoming requests and ordinary maintainable code. Record compatibility and testing limitations in `rust/README.md` rather than claiming upstream parity.
 - Upstream includes multiple providers, desktop and plugin integrations, administration, OAuth, streaming translations and many routes. These are not automatically implemented by a Copilot-only proxy.
 - Automatic payer switching and retry remain unresolved: no documented payer-selection API was found, and replay after forwarding part of a stream is not transparent. Opening GitHub settings is a manual alternative, not completion of the automatic requirement.
+- Pending the partial-tier clarification, sorting uses the highest published output tier available and marks incomplete comparisons; long-context prices remain visible separately.
