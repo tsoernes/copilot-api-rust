@@ -205,6 +205,32 @@ async fn forwards_allowed_headers_body_and_status_but_not_client_secrets() {
 }
 
 #[tokio::test]
+async fn oversized_valid_json_is_forwarded_and_upstream_status_is_preserved() {
+    let mut upstream = mock(StatusCode::PAYLOAD_TOO_LARGE).await;
+    let mut large = Vec::with_capacity(16 * 1024 * 1024 + 128);
+    large.extend_from_slice(b"{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"");
+    large.resize(16 * 1024 * 1024 + 1, b'x');
+    large.extend_from_slice(b"\"}]}");
+    assert!(large.len() > 16 * 1024 * 1024);
+
+    let response = app(&upstream.base, None)
+        .oneshot(request(
+            "/v1/chat/completions",
+            Body::from(Bytes::from(large)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let captured = tokio::time::timeout(Duration::from_secs(5), upstream.requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(captured.path, "/chat/completions");
+    assert!(captured.body.len() > 16 * 1024 * 1024);
+}
+
+#[tokio::test]
 async fn streams_first_chunk_before_upstream_finishes() {
     let mut upstream = mock(StatusCode::OK).await;
     upstream
@@ -309,7 +335,7 @@ async fn rejects_unsafe_hosts_origins_missing_key_and_invalid_requests_before_up
             .await
             .unwrap()
             .status(),
-        StatusCode::PAYLOAD_TOO_LARGE
+        StatusCode::BAD_REQUEST
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), upstream.requests.recv())

@@ -28,7 +28,6 @@ use crate::{
 };
 
 // Request JSON is buffered for header derivation and minor normalization; responses are streamed.
-const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -554,13 +553,13 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
                 "Content-Type must be application/json",
             );
         }
-        let bytes = match to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
+        // Do not impose a gateway-specific payload cap: Copilot should decide
+        // whether a valid request is too large. This is buffered for JSON
+        // inspection/normalization, so large requests still consume local RAM.
+        let bytes = match to_bytes(request.into_body(), usize::MAX).await {
             Ok(b) => b,
             Err(_) => {
-                return error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Request body exceeds limit or could not be read",
-                );
+                return error(StatusCode::BAD_REQUEST, "Could not read request body");
             }
         };
         match prepare_payload(&path, bytes, &headers) {
@@ -888,7 +887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chunked_limit_and_canonicalized_forwarding_are_preserved() {
+    async fn chunked_and_oversized_json_forwarding_are_preserved() {
         use futures_util::stream;
         use tokio::sync::mpsc;
         use tower::ServiceExt;
@@ -899,7 +898,7 @@ mod tests {
                 let tx = tx.clone();
                 async move {
                     let (parts, body) = request.into_parts();
-                    let body = to_bytes(body, MAX_REQUEST_BYTES).await.unwrap();
+                    let body = to_bytes(body, usize::MAX).await.unwrap();
                     tx.send((parts.headers, body)).unwrap();
                     (StatusCode::ACCEPTED, "ok")
                 }
@@ -934,10 +933,10 @@ mod tests {
         let reference: Value =
             serde_json::from_slice(br#"{"model":"old","model":"new","n":1e1}"#).unwrap();
         assert_eq!(forwarded.as_ref(), serde_json::to_vec(&reference).unwrap());
-        // Exactly 16 MiB, including valid trailing JSON whitespace, must be
-        // accepted; the upstream still receives the canonical compact object.
+        // A request larger than the former local limit is parsed and accepted;
+        // harmless trailing whitespace is removed during JSON canonicalization.
         let mut exact = b"{\"model\":\"boundary\"}".to_vec();
-        exact.resize(MAX_REQUEST_BYTES, b' ');
+        exact.resize(16 * 1024 * 1024 + 1, b' ');
         let request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -954,20 +953,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(forwarded.as_ref(), br#"{"model":"boundary"}"#);
-        let oversized = Body::from_stream(stream::iter([
-            Ok::<Bytes, std::io::Error>(Bytes::from(vec![b' '; MAX_REQUEST_BYTES])),
-            Ok(Bytes::from_static(b" ")),
-        ]));
+
+        let unreadable = Body::from_stream(stream::iter([Err::<Bytes, std::io::Error>(
+            std::io::Error::other("broken request body"),
+        )]));
         let request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
             .header(header::HOST, "localhost")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(oversized)
+            .body(unreadable)
             .unwrap();
         assert_eq!(
             app.oneshot(request).await.unwrap().status(),
-            StatusCode::PAYLOAD_TOO_LARGE
+            StatusCode::BAD_REQUEST
         );
         assert!(rx.try_recv().is_err());
         server.abort();
