@@ -287,6 +287,7 @@ pub fn parse_catalog(value: &Value) -> Result<Vec<CatalogModel>, &'static str> {
 pub enum SortKey {
     #[default]
     Output,
+    LongContextOutput,
     Input,
     CacheRead,
     CacheWrite,
@@ -324,12 +325,15 @@ pub fn reference_price(model: &CatalogModel, key: SortKey) -> Option<f64> {
         .filter_map(|tier| valid(quote(tier).and_then(|q| q.output)))
         .max_by(f64::total_cmp);
     }
+    if key == SortKey::LongContextOutput {
+        return valid(quote(model.long_context_prices.as_ref()).and_then(|quote| quote.output));
+    }
     let default = quote(model.default_prices.as_ref())?;
     valid(match key {
         SortKey::Input => default.input,
         SortKey::CacheRead => default.cache_read,
         SortKey::CacheWrite => default.cache_write,
-        SortKey::Output | SortKey::Name => None,
+        SortKey::Output | SortKey::LongContextOutput | SortKey::Name => None,
     })
 }
 
@@ -543,8 +547,12 @@ mod tests {
             id: id.into(),
             name: name.into(),
             default_prices: Some(PriceTier {
-                verified: price,
+                verified: price.clone(),
                 output: Some(9999.0),
+                ..Default::default()
+            }),
+            long_context_prices: Some(PriceTier {
+                verified: price,
                 ..Default::default()
             }),
             ..Default::default()
@@ -566,6 +574,7 @@ mod tests {
         for (key, ascending) in [
             (SortKey::Input, ["b", "a", "missing"]),
             (SortKey::Output, ["a", "b", "missing"]),
+            (SortKey::LongContextOutput, ["a", "b", "missing"]),
             (SortKey::CacheRead, ["b", "a", "missing"]),
             (SortKey::CacheWrite, ["a", "b", "missing"]),
         ] {
@@ -636,6 +645,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(reference_price(&m, SortKey::Output), Some(8.0));
+        assert_eq!(reference_price(&m, SortKey::LongContextOutput), Some(8.0));
         assert_eq!(reference_price(&m, SortKey::Input), Some(3.0));
         assert_eq!(reference_price(&m, SortKey::CacheRead), Some(2.0));
         assert_eq!(reference_price(&m, SortKey::CacheWrite), Some(1.0));
@@ -649,11 +659,14 @@ mod tests {
             .unwrap()
             .output = Some(12.0);
         assert_eq!(reference_price(&m, SortKey::Output), Some(12.0));
+        assert_eq!(reference_price(&m, SortKey::LongContextOutput), Some(8.0));
         m.default_prices.as_mut().unwrap().verified = None;
         assert_eq!(reference_price(&m, SortKey::Output), Some(8.0));
         assert_eq!(reference_price(&m, SortKey::Input), None); // long tier is not the default
+        assert_eq!(reference_price(&m, SortKey::LongContextOutput), Some(8.0)); // exact long tier only
         m.long_context_prices.as_mut().unwrap().verified = None;
         assert_eq!(reference_price(&m, SortKey::Output), None); // raw values are not prices
+        assert_eq!(reference_price(&m, SortKey::LongContextOutput), None);
 
         m.default_prices = Some(tier(Some(f64::NAN), None));
         m.long_context_prices = Some(tier(Some(0.0), None));

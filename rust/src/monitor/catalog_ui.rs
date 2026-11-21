@@ -507,6 +507,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &CatalogView<'_>) 
     let metric = match view.sort_key {
         SortKey::Input => "Input: GitHub ref credits/1M",
         SortKey::Output | SortKey::Name => "Max published output cr/1M (* partial)",
+        SortKey::LongContextOutput => "Long-context output ref cr/1M",
         SortKey::CacheRead => "Cache read: GitHub ref credits/1M",
         SortKey::CacheWrite => "Cache write: GitHub ref credits/1M",
     };
@@ -528,10 +529,9 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &CatalogView<'_>) 
             .take(visible)
             .map(|(i, m)| {
                 let marker = if i == selected { "> " } else { "  " };
-                let key = if view.sort_key == SortKey::Name {
-                    SortKey::Output
-                } else {
-                    view.sort_key
+                let key = match view.sort_key {
+                    SortKey::Name => SortKey::Output,
+                    other => other,
                 };
                 let mut price = number(reference_price(m, key));
                 if key == SortKey::Output && partial_output_reference(m) {
@@ -723,6 +723,11 @@ mod tests {
                 SortKey::Output,
                 "Max published output cr/1M (* partial)",
                 "model-a | 10*",
+            ),
+            (
+                SortKey::LongContextOutput,
+                "Long-context output ref cr/1M",
+                "model-a | —",
             ),
             (
                 SortKey::Input,

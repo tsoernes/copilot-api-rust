@@ -331,7 +331,7 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         .constraints([
             Constraint::Length(2),
             Constraint::Length(3),
-            Constraint::Min(3),
+            Constraint::Min(1),
             Constraint::Length(2),
         ])
         .split(area);
@@ -363,15 +363,10 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
     frame.render_widget(Paragraph::new(header), parts[0]);
     let tab = view.tab.min(5);
     let labels = if area.width < 48 {
-        ["1:O", "2:Q", "3:M", "4:R", "5:S", "6:A"]
+        ["1:O", "2:Q", "3:M", "4:R", "5:S", "6:C"]
     } else {
         [
-            "Overview",
-            "Quota",
-            "Models",
-            "Requests",
-            "Sessions",
-            "Available",
+            "Overview", "Quota", "Models", "Requests", "Sessions", "Catalog",
         ]
     };
     frame.render_widget(
@@ -468,9 +463,9 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     if view.rates.is_some()
         && area.height
             < 5u16
-                .saturating_add(3)
+                .saturating_add(4)
                 .saturating_add(rate_height)
-                .saturating_add(2)
+                .saturating_add(1)
     {
         frame.render_widget(
             Paragraph::new("Resize taller or wider to show overview and all rolling windows.")
@@ -521,21 +516,30 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         );
     }
     let body = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Length(rate_height),
-        Constraint::Min(2),
+        Constraint::Min(1),
     ])
     .split(parts[1]);
-    let detail = format!(
-        " Cache read: {}    Cache write: {}    Nano-AIU: {}",
-        count(totals.get("cache_read_input_tokens"), view.exact_counts),
-        count(totals.get("cache_creation_input_tokens"), view.exact_counts),
-        count(totals.get("total_nano_aiu"), view.exact_counts)
-    );
-    frame.render_widget(
-        Paragraph::new(detail).block(panel("Cache & Copilot")),
-        body[0],
-    );
+    let cache_table = Table::new(
+        [Row::new([
+            count(totals.get("cache_read_input_tokens"), view.exact_counts),
+            count(totals.get("cache_creation_input_tokens"), view.exact_counts),
+            count(totals.get("total_nano_aiu"), view.exact_counts),
+        ])],
+        [
+            Constraint::Percentage(34),
+            Constraint::Percentage(34),
+            Constraint::Percentage(32),
+        ],
+    )
+    .header(
+        Row::new(["Cache read", "Cache write", "Nano-AIU"])
+            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+    )
+    .column_spacing(1)
+    .block(panel("Cache & Copilot"));
+    frame.render_widget(cache_table, body[0]);
     frame.render_widget(
         Paragraph::new(rolling.into_iter().map(Line::from).collect::<Vec<_>>())
             .block(panel("Rolling reported counts · costs estimated")),

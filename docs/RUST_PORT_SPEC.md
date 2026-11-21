@@ -3,6 +3,7 @@
 ## Current requirements
 
 - Create a Rust fork of <https://github.com/caozhiyuan/copilot-api>, commit incrementally, create a public GitHub fork, and push it. (User, 2026-11-20.)
+- Make the repository contain only the Rust version by removing the original non-Rust project, and clearly state that this implementation is compatible with only a limited scope of the original `copilot-api`. (User, 2026-11-21.)
 - Consider low memory usage, but do not over-optimize. (User, 2026-11-20.)
 - Implement usage monitoring like the original project. (User, 2026-11-20.)
 - Implement GitHub sign-in if it is not already present. (User, 2026-11-20.)
@@ -19,6 +20,7 @@
 - Add rolling 7-day and 30-day counters to the terminal monitor. (User, 2026-11-20.)
 - The Models pane should show both per-token model unit prices and credits/AIU spent. Add a separate pane listing all Copilot-provided models and their information, with optional price sorting. Default to the highest available output-tier price first and keep missing or unverified prices visible last; offer other sort orders. (User, 2026-11-20; tier clarified 2026-11-21.)
 - The available-model catalog should be filterable by model name. (User, 2026-11-21.)
+- The model catalog sorting options should include long-context pricing. (User, 2026-11-21.)
 
 ## Open questions
 
@@ -31,4 +33,4 @@
 - Favor streaming responses, bounded incoming requests and ordinary maintainable code. Record compatibility and testing limitations in `rust/README.md` rather than claiming upstream parity.
 - Upstream includes multiple providers, desktop and plugin integrations, administration, OAuth, streaming translations and many routes. These are not automatically implemented by a Copilot-only proxy.
 - Automatic payer switching and retry remain unresolved: no documented payer-selection API was found, and replay after forwarding part of a stream is not transparent. Opening GitHub settings is a manual alternative, not completion of the automatic requirement.
-- Pending the partial-tier clarification, sorting uses the highest published output tier available and marks incomplete comparisons; long-context prices remain visible separately.
+- Output sorting uses the highest independently verified published output price across available tiers and marks incomplete comparisons; the catalog also offers a dedicated long-context-output sort. The Rust-only cleanup remains to be completed.

@@ -355,6 +355,7 @@ impl App {
     fn catalog_sort_label(&self) -> String {
         let key = match self.catalog_sort_key {
             SortKey::Output => "output",
+            SortKey::LongContextOutput => "long-context output",
             SortKey::Input => "input",
             SortKey::CacheRead => "cache read",
             SortKey::CacheWrite => "cache write",
@@ -367,6 +368,7 @@ impl App {
         match self.catalog_sort_key {
             SortKey::Name => format!("{key} {order} · unknown last"),
             SortKey::Output => format!("highest published {key} {order} · unknown last"),
+            SortKey::LongContextOutput => format!("published {key} {order} · unknown last"),
             _ => format!("default {key} {order} · unknown last"),
         }
     }
@@ -604,7 +606,8 @@ impl App {
             }
             KeyCode::Char('s') if self.tab == 5 => {
                 self.catalog_sort_key = match self.catalog_sort_key {
-                    SortKey::Output => SortKey::Input,
+                    SortKey::Output => SortKey::LongContextOutput,
+                    SortKey::LongContextOutput => SortKey::Input,
                     SortKey::Input => SortKey::CacheRead,
                     SortKey::CacheRead => SortKey::CacheWrite,
                     SortKey::CacheWrite => SortKey::Name,
@@ -1300,8 +1303,10 @@ mod tests {
             "low"
         );
         app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        assert_eq!(app.catalog_sort_key, SortKey::Input);
+        assert_eq!(app.catalog_sort_key, SortKey::LongContextOutput);
         assert_eq!(app.catalog_selected, 0);
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.catalog_sort_key, SortKey::Input);
         app.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         assert_eq!(app.catalog_sort_order, SortOrder::Ascending);
         let ids: Vec<_> = app
