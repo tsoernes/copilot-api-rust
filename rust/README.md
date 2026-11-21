@@ -1,6 +1,12 @@
-# copilot-api Rust port (early, incomplete)
+# Copilot API Rust
 
-This is an incremental port of [caozhiyuan/copilot-api](https://github.com/caozhiyuan/copilot-api), based on upstream commit `350dc3d992faa9f539bd9b81de14cf036477c377` (2.9.16). Original source, history, [MIT license](../LICENSE) and [notices](../NOTICE.md) are retained. The root README describes the upstream TypeScript gateway, not this implementation.
+This Rust project is intended to be compatible with a **limited scope** of
+[caozhiyuan/copilot-api](https://github.com/caozhiyuan/copilot-api), based on
+upstream commit `350dc3d992faa9f539bd9b81de14cf036477c377` (2.9.16). The original
+non-Rust implementation is not part of this repository's current source tree.
+This is not a complete port or a drop-in replacement; see
+[Current scope and known gaps](#current-scope-and-known-gaps). The upstream
+[MIT license](../LICENSE) and relevant [notices](../NOTICE.md) are retained.
 
 ## Build and run
 
@@ -25,7 +31,7 @@ After signing in, run `./rust/target/release/copilot-api-rust monitor` in an int
 - In Models, `d` opens the selected model's reference unit prices and reported AIU spend. In Catalog, `/` filters model name, ID, or vendor; type text, Enter to keep, Backspace to edit, or Esc to clear. `s` cycles highest-output, long-context-output, default input, cache-read, cache-write and name sorting; `o` reverses direction; `↑`/`↓` or `j`/`k` selects a model, Home/End jumps, and PgUp/PgDn scrolls its details. By default, the highest available published output-tier reference price sorts first. Input and cache sorts use the default tier; long-context output sorts by its published long-context quote; unknown prices sort last. A partial-tier marker indicates that another reported tier lacks a published reference price.
 - Usage refreshes every five seconds; quota every 60 seconds and on manual refresh. Stale/error status is shown rather than treating missing data as zero.
 
-The monitor displays upstream-reported, persisted usage: in-flight requests may not appear until they complete or are cancelled. Overview and the selected session show rolling 1-minute, 1-hour, 24-hour, 7-day and 30-day counts of **reported usage events**, tokens and estimated costs. These do not count requests for which no usage was reported. They persist across restarts because they use the Rust usage database, but do not include the TypeScript database. Session grouping uses client-provided IDs when available; otherwise each request uses its own ID. Earlier rows saved without a session ID cannot be reconstructed reliably.
+The monitor displays upstream-reported, persisted usage: in-flight requests may not appear until they complete or are cancelled. Overview and the selected session show rolling 1-minute, 1-hour, 24-hour, 7-day and 30-day counts of **reported usage events**, tokens and estimated costs. These do not count requests for which no usage was reported. They persist across restarts in the Rust usage database. Usage from the original gateway database is not imported. Session grouping uses client-provided IDs when available; otherwise each request uses its own ID. Earlier rows saved without a session ID cannot be reconstructed reliably.
 
 Token subcounts are shown only when the provider reported them; older rows lack newly captured details. These subcounts can overlap and should not be added together. The terminal stores only bounded numeric token subcounts, not raw request or response content. Protocol completion observed upstream is recorded as completed even if the client closes before HTTP EOF; this does not prove delivery to the client. A reported incomplete response is shown separately. Existing cancellation labels remain unchanged and may have been classified incorrectly before this fix.
 
@@ -35,21 +41,21 @@ For GitHub organization/enterprise usage, [GitHub describes AI credits as model-
 
 The catalog is fetched from the signed-in Copilot account's `/models` endpoint at startup, every 60 seconds and on `r`; it retains entries even when prices or capabilities are missing. Unit prices labeled **GitHub reference credits / 1M** come from a separately bundled [public pricing snapshot](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing), retrieved 2026-11-20; one AI credit is $0.01 under that reference. Reference matching uses exact provider name and vendor, supported tier/threshold and date checks. It is not a guarantee of your account's actual charges. Dated promotions expire conservatively; ambiguous or outdated (over 30 days) references become unavailable. Raw `/models` price values are separately labeled unverified and are never treated as credits or used for price sorting. The selected-period AIU spend shown beside them is provider-reported and may be partial; it is not a unit price.
 
-To refresh the public reference, run `bun scripts/refresh-copilot-pricing.mjs` from the repository root, review the generated snapshot, and rebuild. The script contacts GitHub's public documentation endpoint only; it does not send account credentials or the model catalog.
+The checked-in price reference is a dated snapshot from GitHub's public documentation. It is separate from `/models` data, and raw model prices are not assumed to be credits.
 
 Automatic payer switching and retry are **not implemented**: GitHub's documented API does not expose a payer-selection operation, and switching after part of a streamed response has reached the client cannot be transparently replayed. GitHub's settings page is the authoritative place to inspect or change the payer. Its billing usage can differ from the gateway's provider quota snapshot, so the latter must not be treated as an authoritative billing balance.
 
-## Usage monitoring
+## HTTP usage monitoring
 
-Open the usage-viewer address printed by `serve`. This serves the original upstream dashboard with the current server as its default endpoint. It includes period selection, charts, model/session summaries and paginated events. Enter the configured API key in the dashboard if needed. The original viewer loads JavaScript and fonts from third-party CDNs and stores entered credentials in browser local storage; use it only in a trusted browser and network.
+Open the usage-viewer address printed by `serve`. The Rust server embeds a static usage dashboard with the current server as its default endpoint. It includes period selection, charts, model/session summaries and paginated events. Enter the configured API key in the dashboard if needed. The viewer loads JavaScript and fonts from third-party CDNs and stores entered credentials in browser local storage; use it only in a trusted browser and network.
 
 Copilot quota is fetched on demand from GitHub using the signed-in GitHub token. The API provides `/usage`, `/usage/github-copilot`, `/token-usage`, `/token-usage/daily`, `/token-usage/events` and `/token-usage/sessions`. These endpoints require the configured API key, if any. Quota results are not cached and may contain account information. Unsupported subscription providers return 404.
 
-Token events are stored separately from upstream TypeScript data in `~/.local/share/copilot-api/rust-usage.sqlite3` (or `$COPILOT_API_HOME/rust-usage.sqlite3`); `COPILOT_API_RUST_USAGE_DB` overrides the file path. Newly created database files are owner-only on Unix. Existing upstream databases are not imported, and foreign/unknown database schemas are rejected. An additive migration adds a nullable token-details column to existing Rust databases without changing historical rows; previous Rust versions can still read and write them. The database contains models, session IDs, truncated user agents, timestamps and token counts; protect it accordingly. No automatic retention or deletion is applied.
+Token events are stored separately from the original gateway's data in `~/.local/share/copilot-api/rust-usage.sqlite3` (or `$COPILOT_API_HOME/rust-usage.sqlite3`); `COPILOT_API_RUST_USAGE_DB` overrides the file path. Newly created database files are owner-only on Unix. Existing upstream databases are not imported, and foreign/unknown database schemas are rejected. An additive migration adds a nullable token-details column to existing Rust databases without changing historical rows; previous Rust versions can still read and write them. The database contains models, session IDs, truncated user agents, timestamps and token counts; protect it accordingly. No automatic retention or deletion is applied.
 
 Only usage actually reported by upstream is recorded. Streaming bytes are forwarded unchanged; completed responses are saved before EOF is delivered, and observed usage from cancelled streams is saved asynchronously. Copilot AIU cost is an estimate based on upstream-reported nano-AIU, not a billing statement. Missing usage is not estimated. To bound memory, JSON responses over 4 MiB and SSE events over 256 KiB can lack monitoring data even though forwarding continues. A response that has not finished may not yet appear in the viewer.
 
-The original multi-provider/admin usage, key isolation, external history import, and all upstream timing/accounting edge cases are not yet implemented. This port cannot report providers or routes it does not support. See [the upstream guide](../docs/guides/en/usage.md) for the original feature set; do not assume complete parity.
+The original multi-provider/admin usage, key isolation, external history import, and all upstream timing/accounting edge cases are not yet implemented. This port cannot report providers or routes it does not support. See the [upstream project](https://github.com/caozhiyuan/copilot-api) for its feature set; do not assume complete parity.
 
 ## Current scope and known gaps
 

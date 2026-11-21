@@ -266,11 +266,11 @@ fn error(status: StatusCode, message: &'static str) -> Response {
 }
 
 async fn usage_viewer() -> Response {
-    // Keep the original viewer, but default to the origin that served it instead
+    // Keep the bundled viewer, but default to the origin that served it instead
     // of assuming localhost:4141, which breaks on custom ports and 127.0.0.1.
     static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let page = PAGE.get_or_init(|| {
-        include_str!("../../pages/index.html")
+        include_str!("../assets/usage-viewer.html")
             .replace(
                 "const DEFAULT_ENDPOINT = \"http://localhost:4141/usage\";",
                 "const DEFAULT_ENDPOINT = window.location.origin + \"/usage\";",

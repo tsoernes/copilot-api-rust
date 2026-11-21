@@ -3,7 +3,7 @@ name = "copilot-api-rust"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "An incremental Rust port of copilot-api"
+description = "A Rust Copilot-compatible API proxy for a limited subset of copilot-api"
 
 [dependencies]
 anyhow = "1"

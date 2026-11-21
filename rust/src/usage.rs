@@ -1,7 +1,7 @@
 //! Durable request usage history for the Rust gateway.
 //!
 //! This store has its own schema and must not silently migrate an upstream
-//! TypeScript database. It records only usage actually reported by a provider.
+//! original gateway database. It records only usage actually reported by a provider.
 use std::{collections::BTreeMap, path::Path, sync::Mutex, time::Duration};
 
 use crate::usage_details::{MAX_DETAIL_FIELDS, MAX_DETAIL_KEY_LEN};

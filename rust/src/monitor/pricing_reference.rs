@@ -1,5 +1,5 @@
 //! Public GitHub documentation reference, independent of provider wire prices.
-//! Regenerate with `bun scripts/refresh-copilot-pricing.mjs` and review the diff.
+//! This checked-in snapshot must be reviewed against GitHub's public pricing documentation before refresh.
 use std::collections::HashMap;
 use std::sync::OnceLock;
 

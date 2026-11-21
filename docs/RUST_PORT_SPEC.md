@@ -25,12 +25,11 @@
 ## Open questions
 
 - Should compact counts be the default with an exact-count toggle, always remain exact with suffixes, or be compact only? (Asked 2026-11-20.)
-- If a model has verified prices for only some tiers, should sorting use its highest verified tier with a partial-comparison marker, or put it after fully verified models? (Asked 2026-11-21.)
 
 ## Implementation notes (not user requirements)
 
-- The fork starts from upstream commit `350dc3d992faa9f539bd9b81de14cf036477c377` (version 2.9.16); the upstream MIT license and history are retained. The Rust implementation lives in `rust/` while parity is developed.
+- The fork starts from upstream commit `350dc3d992faa9f539bd9b81de14cf036477c377` (version 2.9.16); the upstream MIT license and history are retained. The only gateway implementation in the repository is the Rust project under `rust/`; non-Rust source, desktop, plugin and build projects were removed as requested. This remains a limited-scope compatibility implementation, not a claim of full parity.
 - Favor streaming responses, bounded incoming requests and ordinary maintainable code. Record compatibility and testing limitations in `rust/README.md` rather than claiming upstream parity.
 - Upstream includes multiple providers, desktop and plugin integrations, administration, OAuth, streaming translations and many routes. These are not automatically implemented by a Copilot-only proxy.
 - Automatic payer switching and retry remain unresolved: no documented payer-selection API was found, and replay after forwarding part of a stream is not transparent. Opening GitHub settings is a manual alternative, not completion of the automatic requirement.
-- Output sorting uses the highest independently verified published output price across available tiers and marks incomplete comparisons; the catalog also offers a dedicated long-context-output sort. The Rust-only cleanup remains to be completed.
+- Output sorting uses the highest independently verified published output price across available tiers and marks incomplete comparisons; the catalog also offers a dedicated long-context-output sort.
