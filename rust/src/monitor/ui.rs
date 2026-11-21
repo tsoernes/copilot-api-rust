@@ -33,6 +33,8 @@ pub struct View<'a> {
     pub catalog_selected: usize,
     pub catalog_sort_label: &'a str,
     pub catalog_sort_key: SortKey,
+    pub catalog_filter: &'a str,
+    pub catalog_filter_prompt: &'a str,
     pub catalog_detail_scroll: u16,
     pub catalog_status: &'a str,
     pub event_offset: usize,
@@ -398,6 +400,8 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
                 detail_scroll: view.catalog_detail_scroll,
                 status: view.catalog_status,
                 exact_counts: view.exact_counts,
+                filter: view.catalog_filter,
+                filter_prompt: view.catalog_filter_prompt,
             },
         ),
     }
@@ -637,9 +641,16 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         } else {
             quota_quantity(window.get("limit"))
         };
-        let remaining = quota_quantity(window.get("remaining"));
         let reported_quota = quota_quantity(window.get("reportedQuotaRemaining"));
-        let mut lines = vec![
+        // GitHub reports an integer `remaining` plus a more precise
+        // `quota_remaining`. Prefer the precise value in the single display
+        // line rather than presenting both as if they were separate balances.
+        let remaining = if reported_quota != "—" {
+            reported_quota
+        } else {
+            quota_quantity(window.get("remaining"))
+        };
+        let lines = vec![
             format!("{name} · {unit} · reset: {reset}"),
             format!(
                 "Used (derived): {} / Limit: {limit}",
@@ -647,9 +658,6 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             ),
             format!("Remaining: {remaining}"),
         ];
-        if reported_quota != "—" && reported_quota != remaining {
-            lines.push(format!("quota_remaining: {reported_quota}"));
-        }
         let lines = wrap_physical_lines(lines, width);
         groups.push((lines, unlimited, used));
     }
@@ -1420,6 +1428,8 @@ mod tests {
             catalog_selected: 0,
             catalog_sort_label: "output desc",
             catalog_sort_key: SortKey::Output,
+            catalog_filter: "",
+            catalog_filter_prompt: "Filter (press /)",
             catalog_detail_scroll: 0,
             catalog_status: "ok",
             event_offset: 0,
@@ -1982,8 +1992,7 @@ mod tests {
                 "Token-based billing; unit unconfirmed",
                 "Premium",
                 "Used (derived): 400 / Limit: 1,000",
-                "Remaining: 600",
-                "quota_remaining: 600.25",
+                "Remaining: 600.25",
                 "reset: 2026-12-01",
                 "40% used",
                 "Chat",
@@ -1997,6 +2006,10 @@ mod tests {
                     "missing {expected} at {width}x{height}: {display}"
                 );
             }
+            assert!(
+                !display.contains("quota_remaining:"),
+                "duplicate balance: {display}"
+            );
             assert!(
                 !display.contains("requests"),
                 "unsupported unit claim: {display}"

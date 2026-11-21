@@ -157,6 +157,8 @@ struct App {
     quota: Option<Value>,
     catalog: Option<Vec<CatalogModel>>,
     catalog_selected: usize,
+    catalog_filter: String,
+    catalog_filter_active: bool,
     catalog_detail_scroll: u16,
     catalog_sort_key: SortKey,
     catalog_sort_order: SortOrder,
@@ -276,34 +278,68 @@ impl App {
     }
     fn sort_catalog(&mut self) {
         let selected = self
-            .catalog
-            .as_ref()
-            .and_then(|models| models.get(self.catalog_selected))
+            .filtered_catalog()
+            .get(self.catalog_selected)
             .map(|m| m.id.clone());
+        let query = self.catalog_filter.trim().to_lowercase();
         if let Some(models) = &mut self.catalog {
             sort_models(models, self.catalog_sort_key, self.catalog_sort_order);
             self.catalog_selected = selected
                 .as_ref()
-                .and_then(|id| models.iter().position(|model| &model.id == id))
+                .and_then(|id| {
+                    models
+                        .iter()
+                        .filter(|model| {
+                            query.is_empty()
+                                || model.id.to_lowercase().contains(&query)
+                                || model.name.to_lowercase().contains(&query)
+                                || model
+                                    .vendor
+                                    .as_deref()
+                                    .is_some_and(|vendor| vendor.to_lowercase().contains(&query))
+                        })
+                        .position(|model| &model.id == id)
+                })
                 .unwrap_or(0);
         }
         self.catalog_detail_scroll = 0;
     }
+    fn filtered_catalog(&self) -> Vec<CatalogModel> {
+        let query = self.catalog_filter.trim().to_lowercase();
+        self.catalog
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|model| {
+                query.is_empty()
+                    || model.id.to_lowercase().contains(&query)
+                    || model.name.to_lowercase().contains(&query)
+                    || model
+                        .vendor
+                        .as_deref()
+                        .is_some_and(|vendor| vendor.to_lowercase().contains(&query))
+            })
+            .cloned()
+            .collect()
+    }
     fn apply_catalog(&mut self, result: std::result::Result<Value, String>) {
         let selected = self
-            .catalog
-            .as_ref()
-            .and_then(|models| models.get(self.catalog_selected))
+            .filtered_catalog()
+            .get(self.catalog_selected)
             .map(|m| m.id.clone());
         match result.and_then(|value| catalog::parse_catalog(&value).map_err(str::to_owned)) {
             Ok(mut models) => {
                 pricing_reference::annotate_official_prices(&mut models);
                 sort_models(&mut models, self.catalog_sort_key, self.catalog_sort_order);
+                self.catalog = Some(models);
                 self.catalog_selected = selected
                     .as_ref()
-                    .and_then(|id| models.iter().position(|model| &model.id == id))
+                    .and_then(|id| {
+                        self.filtered_catalog()
+                            .iter()
+                            .position(|model| &model.id == id)
+                    })
                     .unwrap_or(0);
-                self.catalog = Some(models);
                 self.catalog_updated = Some(Instant::now());
                 self.catalog_error = None;
             }
@@ -367,18 +403,17 @@ impl App {
         if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             let step = height.saturating_sub(12).max(1);
             let maximum = if self.tab == 5 {
-                self.catalog
-                    .as_ref()
-                    .and_then(|models| {
-                        models.get(self.catalog_selected).map(|model| {
-                            catalog_ui::detail_line_count(
-                                model,
-                                self.summary.as_ref(),
-                                models,
-                                width,
-                                self.exact_counts,
-                            )
-                        })
+                let filtered = self.filtered_catalog();
+                filtered
+                    .get(self.catalog_selected)
+                    .map(|model| {
+                        catalog_ui::detail_line_count(
+                            model,
+                            self.summary.as_ref(),
+                            &filtered,
+                            width,
+                            self.exact_counts,
+                        )
                     })
                     .unwrap_or(0)
             } else if self.tab == 2 && self.show_model_detail {
@@ -423,6 +458,36 @@ impl App {
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
+        }
+        if self.catalog_filter_active && self.tab == 5 {
+            match key.code {
+                KeyCode::Enter => {
+                    self.catalog_filter_active = false;
+                    self.catalog_selected = 0;
+                    self.catalog_detail_scroll = 0;
+                    return Action::None;
+                }
+                KeyCode::Esc => {
+                    self.catalog_filter_active = false;
+                    self.catalog_filter.clear();
+                    self.catalog_selected = 0;
+                    self.catalog_detail_scroll = 0;
+                    return Action::None;
+                }
+                KeyCode::Backspace => {
+                    self.catalog_filter.pop();
+                    self.catalog_selected = 0;
+                    self.catalog_detail_scroll = 0;
+                    return Action::None;
+                }
+                KeyCode::Char(c) if !c.is_control() && self.catalog_filter.chars().count() < 64 => {
+                    self.catalog_filter.push(c);
+                    self.catalog_selected = 0;
+                    self.catalog_detail_scroll = 0;
+                    return Action::None;
+                }
+                _ => return Action::None,
+            }
         }
         if self.confirm_billing {
             return match key.code {
@@ -549,6 +614,10 @@ impl App {
                 self.catalog_selected = 0;
                 Action::None
             }
+            KeyCode::Char('/') if self.tab == 5 => {
+                self.catalog_filter_active = true;
+                Action::None
+            }
             KeyCode::Char('o') if self.tab == 5 => {
                 self.catalog_sort_order = match self.catalog_sort_order {
                     SortOrder::Descending => SortOrder::Ascending,
@@ -649,17 +718,12 @@ impl App {
                 Action::None
             }
             KeyCode::End if self.tab == 5 => {
-                self.catalog_selected = self
-                    .catalog
-                    .as_ref()
-                    .map(Vec::len)
-                    .unwrap_or(0)
-                    .saturating_sub(1);
+                self.catalog_selected = self.filtered_catalog().len().saturating_sub(1);
                 self.catalog_detail_scroll = 0;
                 Action::None
             }
             KeyCode::Down | KeyCode::Char('j') if self.tab == 5 => {
-                let count = self.catalog.as_ref().map(Vec::len).unwrap_or(0);
+                let count = self.filtered_catalog().len();
                 if self.catalog_selected + 1 < count {
                     self.catalog_selected += 1;
                     self.catalog_detail_scroll = 0;
@@ -860,6 +924,15 @@ pub async fn run(
             ),
         };
         let catalog_sort_label = app.catalog_sort_label();
+        let filtered_catalog = app.filtered_catalog();
+        let catalog_rows = app.catalog.as_ref().map(|_| filtered_catalog.as_slice());
+        let catalog_filter_prompt = if app.catalog_filter_active {
+            format!("Filter /{}▏ · Enter keep · Esc cancel", app.catalog_filter)
+        } else if app.catalog_filter.is_empty() {
+            "Filter: / to search model name, ID, or vendor".into()
+        } else {
+            format!("Filter /{} · / edit · Esc clear", app.catalog_filter)
+        };
         let error = app
             .usage_error
             .clone()
@@ -883,7 +956,7 @@ pub async fn run(
                     status: &status,
                     page: app.page,
                     model_offset: app.model_offset,
-                    catalog: app.catalog.as_deref(),
+                    catalog: catalog_rows,
                     show_model_detail: app.show_model_detail,
                     model_detail_scroll: app.model_detail_scroll,
                     catalog_selected: app.catalog_selected,
@@ -891,6 +964,8 @@ pub async fn run(
                     catalog_sort_key: app.catalog_sort_key,
                     catalog_detail_scroll: app.catalog_detail_scroll,
                     catalog_status: &catalog_status,
+                    catalog_filter: &app.catalog_filter,
+                    catalog_filter_prompt: &catalog_filter_prompt,
                     event_offset: app.event_offset,
                     session_page: app.session_page,
                     session_offset: app.session_offset,
@@ -1246,6 +1321,42 @@ mod tests {
         assert!(app.catalog_error.as_deref().unwrap().contains("offline"));
         assert!(app.key(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE)) == Action::None);
         assert_eq!(app.tab, 5);
+    }
+
+    #[test]
+    fn catalog_search_filters_name_id_and_vendor_with_edit_cancel() {
+        let model = |id: &str, name: &str, vendor: &str| CatalogModel {
+            id: id.into(),
+            name: name.into(),
+            vendor: Some(vendor.into()),
+            ..Default::default()
+        };
+        let mut app = App {
+            tab: 5,
+            catalog: Some(vec![
+                model("gpt-thing", "GPT-Model", "OpenAI"),
+                model("claude-thing", "Claude", "Anthropic"),
+                model("vendor-model", "Other", "Special Vendor"),
+            ]),
+            ..Default::default()
+        };
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.catalog_filter_active);
+        for key in ['c', 'L', 'A', 'U', 'D', 'E'] {
+            app.key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        let filtered = app.filtered_catalog();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "claude-thing");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.catalog_filter_active);
+        assert_eq!(app.catalog_filter, "cLAUDE");
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.catalog_filter.is_empty());
+        assert_eq!(app.filtered_catalog().len(), 3);
+        app.catalog_filter = "special vendor".into();
+        assert_eq!(app.filtered_catalog()[0].id, "vendor-model");
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub(super) struct CatalogView<'a> {
     pub sort_label: &'a str,
     pub sort_key: SortKey,
     pub exact_counts: bool,
+    pub filter: &'a str,
+    pub filter_prompt: &'a str,
     /// Physical detail lines, controlled independently of model selection.
     pub detail_scroll: u16,
     pub status: &'a str,
@@ -478,7 +480,12 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &CatalogView<'_>) 
     };
     if models.is_empty() {
         frame.render_widget(
-            Paragraph::new("No models returned by Copilot.").block(panel("Available models")),
+            Paragraph::new(if view.filter.is_empty() {
+                "No models returned by Copilot."
+            } else {
+                "No models match this filter."
+            })
+            .block(panel("Available models")),
             area,
         );
         return;
@@ -503,12 +510,14 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &CatalogView<'_>) 
         SortKey::CacheRead => "Cache read: GitHub ref credits/1M",
         SortKey::CacheWrite => "Cache write: GitHub ref credits/1M",
     };
+    let filter_line = clean(view.filter_prompt);
     let mut rows = vec![
         Line::from(format!(
             "Sort: {} · {}",
             clean(view.sort_label),
             clean(view.status)
         )),
+        Line::from(filter_line),
         Line::from(metric),
     ];
     rows.extend(
@@ -742,6 +751,8 @@ mod tests {
                     summary: None,
                     selected: 0,
                     sort_label: "selected",
+                    filter: "",
+                    filter_prompt: "Filter (press /)",
                     sort_key,
                     exact_counts: true,
                     detail_scroll: 0,
@@ -805,6 +816,8 @@ mod tests {
                 summary: None,
                 selected: 0,
                 sort_label: "output desc",
+                filter: "",
+                filter_prompt: "Filter (press /)",
                 sort_key: SortKey::Output,
                 exact_counts: true,
                 detail_scroll: 0,
@@ -876,6 +889,8 @@ mod tests {
                 summary: None,
                 selected: 0,
                 sort_label: "output desc",
+                filter: "",
+                filter_prompt: "Filter (press /)",
                 sort_key: SortKey::Output,
                 exact_counts: true,
                 detail_scroll: 0,
@@ -912,6 +927,8 @@ mod tests {
                 summary: Some(&summary),
                 selected: 0,
                 sort_label: "output desc",
+                filter: "",
+                filter_prompt: "Filter (press /)",
                 sort_key: SortKey::Output,
                 exact_counts: true,
                 detail_scroll: 0,
@@ -955,6 +972,8 @@ mod tests {
             summary: None,
             selected: 0,
             sort_label: "output desc",
+            filter: "",
+            filter_prompt: "Filter (press /)",
             sort_key: SortKey::Output,
             exact_counts: true,
             detail_scroll: 0,
@@ -970,5 +989,28 @@ mod tests {
         let mut tiny = Terminal::new(TestBackend::new(15, 5)).unwrap();
         tiny.draw(|f| render(f, f.area(), &view)).unwrap();
         assert!(text(&tiny).contains("Resize"));
+    }
+
+    #[test]
+    fn filter_prompt_and_empty_match_are_visible() {
+        let models = fixture();
+        let mut view = CatalogView {
+            models: Some(&models),
+            summary: None,
+            selected: 0,
+            sort_label: "output desc",
+            sort_key: SortKey::Output,
+            exact_counts: true,
+            filter: "claude",
+            filter_prompt: "Filter /claude▏ · Enter keep · Esc cancel",
+            detail_scroll: 0,
+            status: "ok",
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| render(f, f.area(), &view)).unwrap();
+        assert!(text(&terminal).contains("Filter /claude"));
+        view.models = Some(&[]);
+        terminal.draw(|f| render(f, f.area(), &view)).unwrap();
+        assert!(text(&terminal).contains("No models match this filter"));
     }
 }
