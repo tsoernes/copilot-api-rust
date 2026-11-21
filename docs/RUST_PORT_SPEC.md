@@ -9,6 +9,7 @@
 - Implement usage monitoring like the original project. (User, 2026-11-20.)
 - Implement GitHub sign-in if it is not already present. (User, 2026-11-20.)
 - Implement a rich terminal UI for monitoring. Start the server and dashboard together; prioritize an overview, quota, models and recent requests, with a five-second refresh. (User, 2026-11-20.)
+- Put a monitor screenshot preview on the repository front page and link it to a gallery containing all monitor panes. (User, 2026-11-21.)
 - Refresh GitHub quota every 60 seconds and on manual refresh, while local statistics refresh every five seconds. (User, 2026-11-20.)
 - Stop the server started by the dashboard when the dashboard is quit. (User, 2026-11-20.)
 - The terminal request display should provide the most fine-grained token breakdown possible, rather than only a single total. The user reports that many requests appear incorrectly as cancelled; investigate and correct the classification. (User, 2026-11-20.)

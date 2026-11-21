@@ -7,6 +7,10 @@ WebSockets, administration, plugins, and desktop features are not implemented.
 See [the compatibility notes](rust/README.md#current-scope-and-known-gaps)
 before using it.
 
+[![Overview of the Rust terminal monitor — synthetic sample data](rust/assets/screenshots/overview.png)](docs/monitor-gallery.md)
+
+[View the screenshot gallery of all six monitor panes](docs/monitor-gallery.md) · synthetic sample data
+
 ## Build and run
 
 ```fish
