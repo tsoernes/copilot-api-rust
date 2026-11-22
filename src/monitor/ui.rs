@@ -288,6 +288,68 @@ fn rate_lines(rates: Option<&Value>, width: usize, exact: bool) -> Vec<String> {
     lines
 }
 
+const RATE_TABLE_HEADERS: [&str; 4] = ["Window", "Requests", "Tokens", "Est. cost"];
+
+fn rate_table_rows(rates: Option<&Value>, exact: bool) -> Option<Vec<[String; 4]>> {
+    let windows = rates
+        .and_then(|value| value.get("windows"))
+        .and_then(Value::as_array)?;
+    Some(
+        [
+            ("minute", "1m"),
+            ("hour", "1h"),
+            ("day", "24h"),
+            ("week", "7d"),
+            ("month", "30d"),
+        ]
+        .into_iter()
+        .map(|(id, default_label)| {
+            let Some(window) = windows
+                .iter()
+                .find(|window| window.get("id").and_then(Value::as_str) == Some(id))
+            else {
+                return [default_label.to_owned(), "—".into(), "—".into(), "—".into()];
+            };
+            let period = match window.get("duration_seconds").and_then(Value::as_u64) {
+                Some(60) => "1m".to_owned(),
+                Some(3600) => "1h".to_owned(),
+                Some(86400) => "24h".to_owned(),
+                Some(604800) => "7d".to_owned(),
+                Some(2592000) => "30d".to_owned(),
+                Some(seconds) => format!("{seconds}s"),
+                None => default_label.to_owned(),
+            };
+            let totals = window.get("totals").unwrap_or(&Value::Null);
+            [
+                period,
+                count(totals.get("request_count"), exact),
+                count(totals.get("total_tokens"), exact),
+                cost(totals),
+            ]
+        })
+        .collect(),
+    )
+}
+
+fn rate_table_widths(rows: &[[String; 4]]) -> [u16; 4] {
+    std::array::from_fn(|column| {
+        let width = rows
+            .iter()
+            .map(|row| row[column].chars().count())
+            .max()
+            .unwrap_or_default()
+            .max(RATE_TABLE_HEADERS[column].chars().count());
+        u16::try_from(width).unwrap_or(u16::MAX)
+    })
+}
+
+fn rate_table_total_width(rows: &[[String; 4]]) -> u16 {
+    // Three one-cell column gaps plus the panel's left/right borders.
+    rate_table_widths(rows)
+        .into_iter()
+        .fold(5u16, u16::saturating_add)
+}
+
 fn wrap_physical_lines(lines: Vec<String>, width: usize) -> Vec<String> {
     let mut wrapped = Vec::new();
     for line in lines {
@@ -457,15 +519,23 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         .summary
         .and_then(|s| s.get("totals"))
         .unwrap_or(&Value::Null);
-    let width = usize::from(area.width.saturating_sub(2));
-    let rolling = wrap_physical_lines(rate_lines(view.rates, width, view.exact_counts), width);
-    let rate_height = u16::try_from(rolling.len().saturating_add(2)).unwrap_or(u16::MAX);
+    let rolling = rate_table_rows(view.rates, view.exact_counts);
+    let rate_height = u16::try_from(
+        rolling
+            .as_ref()
+            .map_or(3, |rows| rows.len().saturating_add(3)),
+    )
+    .unwrap_or(u16::MAX);
+    let rate_too_wide = rolling
+        .as_ref()
+        .is_some_and(|rows| rate_table_total_width(rows) > area.width);
     if view.rates.is_some()
-        && area.height
-            < 5u16
-                .saturating_add(4)
-                .saturating_add(rate_height)
-                .saturating_add(1)
+        && (rate_too_wide
+            || area.height
+                < 3u16
+                    .saturating_add(4)
+                    .saturating_add(rate_height)
+                    .saturating_add(1))
     {
         frame.render_widget(
             Paragraph::new("Resize taller or wider to show overview and all rolling windows.")
@@ -475,7 +545,7 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         );
         return;
     }
-    let parts = Layout::vertical([Constraint::Length(5), Constraint::Min(3)]).split(area);
+    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(area);
     let cards = Layout::horizontal([
         Constraint::Percentage(25),
         Constraint::Percentage(25),
@@ -540,11 +610,26 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     .column_spacing(1)
     .block(panel("Cache & Copilot"));
     frame.render_widget(cache_table, body[0]);
-    frame.render_widget(
-        Paragraph::new(rolling.into_iter().map(Line::from).collect::<Vec<_>>())
-            .block(panel("Rolling reported counts · costs estimated")),
-        body[1],
-    );
+    if let Some(rows) = rolling {
+        let widths = rate_table_widths(&rows);
+        let table = Table::new(
+            rows.into_iter().map(Row::new),
+            widths.map(Constraint::Length),
+        )
+        .header(
+            Row::new(RATE_TABLE_HEADERS)
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        )
+        .column_spacing(1)
+        .block(panel("Rolling reported counts · costs estimated"));
+        frame.render_widget(table, body[1]);
+    } else {
+        frame.render_widget(
+            Paragraph::new("Rolling reported counts: unavailable")
+                .block(panel("Rolling reported counts · costs estimated")),
+            body[1],
+        );
+    }
     let values: Vec<u64> = view
         .daily
         .and_then(|v| v.get("days"))
@@ -665,12 +750,21 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         let lines = wrap_physical_lines(lines, width);
         groups.push((lines, unlimited, used));
     }
-    let required = groups
+    let compact_required = groups
         .iter()
         .map(|(lines, _, _)| lines.len().saturating_add(1))
         .sum::<usize>()
         + usize::from(token_based);
-    if required > usize::from(inner.height) {
+    let boxed_required = groups
+        .iter()
+        .map(|(lines, unlimited, used)| {
+            let gauge_height = if !unlimited && used.is_some() { 3 } else { 1 };
+            lines.len().saturating_add(gauge_height)
+        })
+        .sum::<usize>()
+        + usize::from(token_based);
+    let boxed_gauges = boxed_required <= usize::from(inner.height);
+    if compact_required > usize::from(inner.height) {
         frame.render_widget(
             Paragraph::new("Resize taller or wider to show all quota counts and reset times.")
                 .wrap(Wrap { trim: true }),
@@ -680,10 +774,15 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     }
     let mut constraints: Vec<_> = groups
         .iter()
-        .flat_map(|(lines, _, _)| {
+        .flat_map(|(lines, unlimited, used)| {
+            let gauge_height = if boxed_gauges && !unlimited && used.is_some() {
+                3
+            } else {
+                1
+            };
             [
                 Constraint::Length(u16::try_from(lines.len()).unwrap_or(u16::MAX)),
-                Constraint::Length(1),
+                Constraint::Length(gauge_height),
             ]
         })
         .collect();
@@ -717,6 +816,11 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             };
             frame.render_widget(
                 Gauge::default()
+                    .block(if boxed_gauges {
+                        panel("Usage")
+                    } else {
+                        Block::default()
+                    })
                     .gauge_style(Style::default().fg(color))
                     .ratio(clamped / 100.0)
                     .label(format!("{used}% used")),
@@ -1858,11 +1962,30 @@ mod tests {
             terminal.draw(|f| render(f, &v)).unwrap();
             let display = render_text(&terminal);
             assert!(display.contains("Rolling reported counts"), "{display}");
-            assert!(display.contains("1m: 11 req / 111 tok"), "{display}");
-            assert!(display.contains("1h: 22 req / 222 tok"), "{display}");
-            assert!(display.contains("24h: —"), "{display}");
-            assert!(display.contains("7d: —"), "{display}");
-            assert!(display.contains("30d: —"), "{display}");
+            for header in RATE_TABLE_HEADERS {
+                assert!(display.contains(header), "missing {header}: {display}");
+            }
+            let rows = rate_table_rows(Some(&rates), false).unwrap();
+            assert_eq!(
+                rows[0],
+                ["1m".to_owned(), "11".into(), "111".into(), "—".into()]
+            );
+            assert_eq!(
+                rows[1],
+                ["1h".to_owned(), "22".into(), "222".into(), "—".into()]
+            );
+            assert_eq!(
+                rows[2],
+                ["24h".to_owned(), "—".into(), "—".into(), "—".into()]
+            );
+            assert_eq!(
+                rows[3],
+                ["7d".to_owned(), "—".into(), "—".into(), "—".into()]
+            );
+            assert_eq!(
+                rows[4],
+                ["30d".to_owned(), "—".into(), "—".into(), "—".into()]
+            );
         }
     }
 
@@ -1889,19 +2012,43 @@ mod tests {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal.draw(|f| render(f, &v)).unwrap();
                 let display = render_text(&terminal);
-                for expected in [
-                    "1m: 1 req / 10 tok",
-                    "1h: 2 req / 20 tok",
-                    "24h: 3 req / 30 tok",
-                    "7d: 4 req / 40 tok",
-                    "30d: 5 req / 50 tok",
-                    "USD 0.0400",
-                    "USD 0.0500",
-                ] {
-                    assert!(
-                        display.contains(expected),
-                        "missing {expected} in tab {tab} at {width}x{height}: {display}"
-                    );
+                if tab == 0 {
+                    for header in RATE_TABLE_HEADERS {
+                        assert!(display.contains(header), "missing {header}: {display}");
+                    }
+                    let rows = rate_table_rows(Some(&rates), false).unwrap();
+                    for (index, expected) in [
+                        ["1m", "1", "10", "USD 0.0100"],
+                        ["1h", "2", "20", "USD 0.0200"],
+                        ["24h", "3", "30", "USD 0.0300"],
+                        ["7d", "4", "40", "USD 0.0400"],
+                        ["30d", "5", "50", "USD 0.0500"],
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        for column in 0..4 {
+                            assert_eq!(
+                                rows[index][column], expected[column],
+                                "wrong table row {index}, column {column}"
+                            );
+                        }
+                    }
+                } else {
+                    for expected in [
+                        "1m: 1 req / 10 tok",
+                        "1h: 2 req / 20 tok",
+                        "24h: 3 req / 30 tok",
+                        "7d: 4 req / 40 tok",
+                        "30d: 5 req / 50 tok",
+                        "USD 0.0400",
+                        "USD 0.0500",
+                    ] {
+                        assert!(
+                            display.contains(expected),
+                            "missing {expected} in tab {tab} at {width}x{height}: {display}"
+                        );
+                    }
                 }
             }
         }
@@ -2008,6 +2155,12 @@ mod tests {
                 assert!(
                     display.contains(expected),
                     "missing {expected} at {width}x{height}: {display}"
+                );
+            }
+            if width == 178 {
+                assert!(
+                    display.contains("┌ Usage"),
+                    "missing boxed gauge: {display}"
                 );
             }
             assert!(

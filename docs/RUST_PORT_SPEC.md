@@ -24,6 +24,8 @@
 - If supported, provide optional automatic billing-account switching when a stream reports monthly quota exhaustion. It must be off by default, restricted to a user-selected ordered allowlist, and automatically retry the failed request once after switching. (User, 2026-11-20.)
 - Display token and other count quantities using thousands/millions-style units (K, M, etc.). (User, 2026-11-20.)
 - Add rolling 7-day and 30-day counters to the terminal monitor. (User, 2026-11-20.)
+- Display rolling reported counts in a table with period, request, token, and estimated-cost columns. (User, 2026-11-22.)
+- Draw a visible box around the quota percent-used bar. (User, 2026-11-22.)
 - The Models pane should show both per-token model unit prices and credits/AIU spent. Add a separate pane listing all Copilot-provided models and their information, with optional price sorting. Default to the highest available output-tier price first and keep missing or unverified prices visible last; offer other sort orders. (User, 2026-11-20; tier clarified 2026-11-21.)
 - The available-model catalog should be filterable by model name. (User, 2026-11-21.)
 - The model catalog sorting options should include long-context pricing. (User, 2026-11-21.)
