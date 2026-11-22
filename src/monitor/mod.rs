@@ -5,7 +5,7 @@ mod pricing_reference;
 mod ui;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{self, IsTerminal, Write},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -129,6 +129,56 @@ impl Drop for Screen {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct QuotaSample {
+    observed_at: Instant,
+    remaining: f64,
+}
+
+fn estimate_quota_runout(samples: &VecDeque<QuotaSample>, remaining: f64, now: Instant) -> String {
+    if !remaining.is_finite() {
+        return "unavailable".into();
+    }
+    if remaining <= 0.0 {
+        return "already depleted".into();
+    }
+    if samples.len() < 3 {
+        return "collecting samples".into();
+    }
+    let Some(first) = samples.front() else {
+        return "collecting samples".into();
+    };
+    let Some(last) = samples.back() else {
+        return "collecting samples".into();
+    };
+    let elapsed = last
+        .observed_at
+        .saturating_duration_since(first.observed_at)
+        .as_secs_f64();
+    if elapsed < 120.0 || now.saturating_duration_since(last.observed_at) > Duration::from_secs(180)
+    {
+        return "collecting samples".into();
+    }
+    let decline = first.remaining - last.remaining;
+    if decline <= 0.0 {
+        return "no drawdown".into();
+    }
+    let seconds = remaining * elapsed / decline;
+    if !seconds.is_finite() || seconds > 10.0 * 365.0 * 24.0 * 60.0 * 60.0 {
+        return ">10y".into();
+    }
+    let minutes = (seconds / 60.0).ceil() as u64;
+    if minutes == 0 {
+        "<1m".into()
+    } else if minutes < 60 {
+        format!("~{minutes}m")
+    } else if minutes < 24 * 60 {
+        format!("~{}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!("~{}d {}h", minutes / (24 * 60), (minutes / 60) % 24)
+    }
+}
+
 #[derive(Default)]
 struct App {
     tab: usize,
@@ -155,6 +205,7 @@ struct App {
     rates: Option<Value>,
     session_rates: Option<Value>,
     quota: Option<Value>,
+    quota_samples: HashMap<String, VecDeque<QuotaSample>>,
     catalog: Option<Vec<CatalogModel>>,
     catalog_selected: usize,
     catalog_filter: String,
@@ -384,12 +435,97 @@ impl App {
     }
     fn apply_quota(&mut self, result: std::result::Result<Value, String>) {
         match result {
-            Ok(value) => {
+            Ok(mut value) => {
+                self.update_quota_runout_estimates(&mut value, Instant::now());
                 self.quota = Some(value);
                 self.quota_updated = Some(Instant::now());
                 self.quota_error = None;
             }
             Err(error) => self.quota_error = Some(format!("Quota stale / unavailable: {error}")),
+        }
+    }
+
+    fn update_quota_runout_estimates(&mut self, quota: &mut Value, observed_at: Instant) {
+        let plan = quota
+            .get("planType")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let token_based = quota
+            .get("tokenBasedBilling")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let Some(windows) = quota.get_mut("windows").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for (index, window) in windows.iter_mut().enumerate() {
+            let unlimited = window
+                .get("unlimited")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let remaining = window
+                .get("reportedQuotaRemaining")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+                .or_else(|| {
+                    window
+                        .get("remaining")
+                        .and_then(Value::as_f64)
+                        .filter(|value| value.is_finite())
+                });
+            let estimate = if unlimited {
+                "unlimited".to_owned()
+            } else if let Some(remaining) = remaining {
+                let identity = window
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .or_else(|| window.get("name").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("window-{index}"));
+                let unit = window
+                    .get("unit")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let reset = window
+                    .get("resetDate")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no-reset-date");
+                let limit = window
+                    .get("limit")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "no-limit".into());
+                let key = format!("{plan}|{token_based}|{identity}|{unit}|{reset}|{limit}");
+                let samples = self.quota_samples.entry(key).or_default();
+                if samples
+                    .back()
+                    .is_some_and(|last| remaining > last.remaining)
+                {
+                    samples.clear();
+                }
+                if let Some(last) = samples.back_mut()
+                    && observed_at.saturating_duration_since(last.observed_at)
+                        < Duration::from_secs(30)
+                {
+                    *last = QuotaSample {
+                        observed_at,
+                        remaining,
+                    };
+                } else {
+                    samples.push_back(QuotaSample {
+                        observed_at,
+                        remaining,
+                    });
+                }
+                while samples.len() > 10 {
+                    samples.pop_front();
+                }
+                estimate_quota_runout(samples, remaining, observed_at)
+            } else {
+                "unavailable".into()
+            };
+            if let Some(object) = window.as_object_mut() {
+                object.insert("runoutEstimate".into(), Value::String(estimate));
+            }
         }
     }
     fn key_in_terminal(&mut self, key: KeyEvent, width: u16, height: u16) -> Action {
@@ -1041,6 +1177,33 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_runout_estimate_uses_recent_balance_decrease_and_resets_on_refill() {
+        let start = Instant::now();
+        let mut app = App::default();
+        for (elapsed, remaining) in [(0, 100.0), (60, 90.0), (120, 80.0)] {
+            let mut quota = serde_json::json!({
+                "planType":"individual",
+                "windows":[{"id":"premium","name":"Premium","unit":"requests","limit":1000,"remaining":remaining,"resetDate":"2026-12-01"}]
+            });
+            app.update_quota_runout_estimates(&mut quota, start + Duration::from_secs(elapsed));
+            if elapsed == 120 {
+                assert_eq!(quota["windows"][0]["runoutEstimate"], "~8m");
+            }
+        }
+
+        let mut refilled = serde_json::json!({
+            "planType":"individual",
+            "windows":[{"id":"premium","name":"Premium","unit":"requests","limit":1000,"remaining":500,"resetDate":"2026-12-01"}]
+        });
+        app.update_quota_runout_estimates(&mut refilled, start + Duration::from_secs(180));
+        assert_eq!(
+            refilled["windows"][0]["runoutEstimate"],
+            "collecting samples"
+        );
+    }
+
     #[test]
     fn keys_navigate_without_leaking_old_period_data() {
         let mut app = App {

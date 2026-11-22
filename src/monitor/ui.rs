@@ -739,13 +739,22 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         } else {
             quota_quantity(window.get("remaining"))
         };
+        let runout = window
+            .get("runoutEstimate")
+            .and_then(Value::as_str)
+            .unwrap_or("unavailable");
+        let remaining_line = if unlimited {
+            format!("Remaining: {remaining}")
+        } else {
+            format!("Remaining: {remaining} · ETA: {runout}")
+        };
         let lines = vec![
             format!("{name} · {unit} · reset: {reset}"),
             format!(
                 "Used (derived): {} / Limit: {limit}",
                 quota_quantity(window.get("used"))
             ),
-            format!("Remaining: {remaining}"),
+            remaining_line,
         ];
         let lines = wrap_physical_lines(lines, width);
         groups.push((lines, unlimited, used));
@@ -2176,6 +2185,28 @@ mod tests {
                 "inferred remaining: {display}"
             );
         }
+    }
+
+    #[test]
+    fn quota_shows_runout_eta_in_the_boxed_usage_gauge() {
+        let null = Value::Null;
+        let quota = json!({"windows":[{
+            "name":"Premium",
+            "usedPercent":41.6,
+            "remaining":100,
+            "runoutEstimate":"~2d 3h"
+        }]});
+        let mut v = view(&null, &null, &null, &quota);
+        v.tab = 1;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| render(f, &v)).unwrap();
+        let display = render_text(&terminal);
+        assert!(
+            display.contains("Remaining: 100 · ETA: ~2d 3h"),
+            "{display}"
+        );
+        assert!(display.contains("┌ Usage"), "{display}");
+        assert!(display.contains("41.6% used"), "{display}");
     }
 
     #[test]
