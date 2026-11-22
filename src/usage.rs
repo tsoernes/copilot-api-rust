@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, path::Path, sync::Mutex, time::Duration};
 use crate::usage_details::{MAX_DETAIL_FIELDS, MAX_DETAIL_KEY_LEN};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Datelike, Days, Local, NaiveDate, SecondsFormat, TimeZone, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 const APPLICATION_ID: i64 = 0x43505255; // "CPRU"
@@ -16,6 +16,24 @@ const SCHEMA_VERSION: i64 = 1;
 const MAX_DAILY_BUCKETS: usize = 3660;
 const MAX_TOKEN_DETAILS_JSON_BYTES: usize = 8192;
 const MAX_RATE_SESSION_ID_BYTES: usize = 1024;
+const QUOTA_SAMPLE_BUCKET_MS: i64 = 5 * 60 * 1000;
+const QUOTA_RUNOUT_LOOKBACK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const QUOTA_RUNOUT_MIN_SPAN_MS: i64 = 10 * 60 * 1000;
+const MAX_QUOTA_WINDOW_KEY_BYTES: usize = 2048;
+
+#[derive(Clone, Copy, Debug)]
+struct QuotaSnapshotPoint {
+    observed_at_ms: i64,
+    remaining: f64,
+}
+
+#[derive(Debug)]
+struct QuotaWindowSnapshot {
+    index: usize,
+    key: Option<String>,
+    remaining: Option<f64>,
+    unlimited: bool,
+}
 
 /// One upstream-reported usage observation. All-zero tokens without reported AIU are ignored.
 /// Times are milliseconds; token counts are nonnegative integers.
@@ -69,6 +87,71 @@ fn parse_token_details(raw: Option<String>) -> Option<BTreeMap<String, i64>> {
     let raw = raw.filter(|raw| raw.len() <= MAX_TOKEN_DETAILS_JSON_BYTES)?;
     let details: BTreeMap<String, i64> = serde_json::from_str(&raw).ok()?;
     valid_token_details(&details).then_some(details)
+}
+
+fn quota_snapshot_key(
+    plan: Option<&str>,
+    token_based: Option<bool>,
+    window: &Value,
+    index: usize,
+) -> Result<Option<String>> {
+    let identity = window
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| window.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("window-{index}"));
+    let unit = window
+        .get("unit")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let reset = window
+        .get("resetDate")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let limit = window.get("limit").map(Value::to_string);
+    let key = serde_json::to_string(&(plan, token_based, identity, unit, reset, limit))?;
+    Ok((key.len() <= MAX_QUOTA_WINDOW_KEY_BYTES).then_some(key))
+}
+
+fn estimate_quota_runout(points: &[QuotaSnapshotPoint], remaining: f64) -> String {
+    if !remaining.is_finite() {
+        return "unavailable".into();
+    }
+    if remaining <= 0.0 {
+        return "already depleted".into();
+    }
+    if points.len() < 3 {
+        return "collecting samples".into();
+    }
+    let Some(first) = points.first() else {
+        return "collecting samples".into();
+    };
+    let Some(last) = points.last() else {
+        return "collecting samples".into();
+    };
+    let elapsed_ms = last.observed_at_ms.saturating_sub(first.observed_at_ms);
+    if elapsed_ms < QUOTA_RUNOUT_MIN_SPAN_MS {
+        return "collecting samples".into();
+    }
+    let decline = first.remaining - last.remaining;
+    if decline <= 0.0 {
+        return "no drawdown".into();
+    }
+    let seconds = remaining * (elapsed_ms as f64 / 1000.0) / decline;
+    if !seconds.is_finite() || seconds > 10.0 * 365.0 * 24.0 * 60.0 * 60.0 {
+        return ">10y".into();
+    }
+    let minutes = (seconds / 60.0).ceil() as u64;
+    if minutes == 0 {
+        "<1m".into()
+    } else if minutes < 60 {
+        format!("~{minutes}m")
+    } else if minutes < 24 * 60 {
+        format!("~{}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!("~{}d {}h", minutes / (24 * 60), (minutes / 60) % 24)
+    }
 }
 
 impl UsageStore {
@@ -159,6 +242,52 @@ impl UsageStore {
                     && primary_key == 0 => {}
             Some(_) => bail!("usage database token_details column has an unsupported schema"),
         }
+        // Quota snapshots are a separate additive table. Keeping the original
+        // app ID and schema version lets older Rust binaries continue to use
+        // the request-usage table without interpreting this new data.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS rust_quota_snapshots (
+            window_key TEXT NOT NULL,
+            bucket_start_ms INTEGER NOT NULL,
+            observed_at_ms INTEGER NOT NULL,
+            remaining REAL NOT NULL,
+            PRIMARY KEY (window_key, bucket_start_ms)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS rust_quota_observed ON rust_quota_snapshots(observed_at_ms);",
+        )?;
+        let quota_columns = {
+            let mut columns = tx.prepare("PRAGMA table_info(rust_quota_snapshots)")?;
+            let names = columns.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            names.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let expected_quota_columns = [
+            ("window_key", "TEXT", 1, 1),
+            ("bucket_start_ms", "INTEGER", 1, 2),
+            ("observed_at_ms", "INTEGER", 1, 0),
+            ("remaining", "REAL", 1, 0),
+        ];
+        if quota_columns.len() != expected_quota_columns.len()
+            || quota_columns.iter().zip(expected_quota_columns).any(
+                |(
+                    (name, column_type, not_null, primary_key),
+                    (expected_name, expected_type, expected_not_null, expected_primary_key),
+                )| {
+                    name != expected_name
+                        || !column_type.eq_ignore_ascii_case(expected_type)
+                        || *not_null != expected_not_null
+                        || *primary_key != expected_primary_key
+                },
+            )
+        {
+            bail!("usage database quota snapshots table has an unsupported schema");
+        }
         tx.commit()?;
         Ok(Self { db: Mutex::new(db) })
     }
@@ -167,6 +296,127 @@ impl UsageStore {
         self.db
             .lock()
             .map_err(|_| anyhow!("usage database lock poisoned"))
+    }
+
+    /// Persist the current GitHub quota balances and attach multi-day runout estimates.
+    /// Only numeric balances and quota-window identity are stored; no account or credential data.
+    pub fn record_quota_snapshots(&self, quota: &mut Value) -> Result<()> {
+        self.record_quota_snapshots_at(quota, Utc::now().timestamp_millis())
+    }
+
+    fn record_quota_snapshots_at(&self, quota: &mut Value, now_ms: i64) -> Result<()> {
+        let Some(windows) = quota.get("windows").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        let plan = quota.get("planType").and_then(Value::as_str);
+        let token_based = quota.get("tokenBasedBilling").and_then(Value::as_bool);
+        let snapshots: Vec<_> = windows
+            .iter()
+            .enumerate()
+            .map(|(index, window)| {
+                let unlimited = window
+                    .get("unlimited")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let remaining = window
+                    .get("reportedQuotaRemaining")
+                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_finite())
+                    .or_else(|| {
+                        window
+                            .get("remaining")
+                            .and_then(Value::as_f64)
+                            .filter(|value| value.is_finite())
+                    });
+                let key = quota_snapshot_key(plan, token_based, window, index)?;
+                Ok(QuotaWindowSnapshot {
+                    index,
+                    key,
+                    remaining,
+                    unlimited,
+                })
+            })
+            .collect::<Result<_>>()?;
+        if snapshots.is_empty() {
+            return Ok(());
+        }
+
+        let cutoff_ms = now_ms.saturating_sub(QUOTA_RUNOUT_LOOKBACK_MS);
+        let bucket_start_ms = now_ms.div_euclid(QUOTA_SAMPLE_BUCKET_MS) * QUOTA_SAMPLE_BUCKET_MS;
+        let mut estimates = Vec::with_capacity(snapshots.len());
+        let mut db = self.lock()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM rust_quota_snapshots WHERE observed_at_ms < ?",
+            [cutoff_ms],
+        )?;
+
+        for snapshot in snapshots {
+            let estimate = if snapshot.unlimited {
+                if let Some(key) = snapshot.key {
+                    tx.execute(
+                        "DELETE FROM rust_quota_snapshots WHERE window_key = ?",
+                        [key],
+                    )?;
+                }
+                "unlimited".to_owned()
+            } else if let (Some(key), Some(remaining)) = (snapshot.key, snapshot.remaining) {
+                let previous: Option<f64> = tx
+                    .query_row(
+                        "SELECT remaining FROM rust_quota_snapshots
+                         WHERE window_key = ? AND observed_at_ms <= ?
+                         ORDER BY observed_at_ms DESC, bucket_start_ms DESC LIMIT 1",
+                        params![key, now_ms],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if previous.is_some_and(|previous| remaining > previous) {
+                    // A top-up or reset invalidates the previous drawdown trend.
+                    tx.execute(
+                        "DELETE FROM rust_quota_snapshots WHERE window_key = ?",
+                        [&key],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO rust_quota_snapshots
+                     (window_key, bucket_start_ms, observed_at_ms, remaining)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT(window_key, bucket_start_ms) DO UPDATE SET
+                       observed_at_ms = excluded.observed_at_ms,
+                       remaining = excluded.remaining",
+                    params![key, bucket_start_ms, now_ms, remaining],
+                )?;
+                let points = {
+                    let mut statement = tx.prepare(
+                        "SELECT observed_at_ms, remaining FROM rust_quota_snapshots
+                         WHERE window_key = ? AND observed_at_ms >= ? AND observed_at_ms <= ?
+                         ORDER BY bucket_start_ms, observed_at_ms",
+                    )?;
+                    statement
+                        .query_map(params![key, cutoff_ms, now_ms], |row| {
+                            Ok(QuotaSnapshotPoint {
+                                observed_at_ms: row.get(0)?,
+                                remaining: row.get(1)?,
+                            })
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                estimate_quota_runout(&points, remaining)
+            } else {
+                "unavailable".to_owned()
+            };
+            estimates.push((snapshot.index, estimate));
+        }
+        tx.commit()?;
+
+        if let Some(windows) = quota.get_mut("windows").and_then(Value::as_array_mut) {
+            for (index, estimate) in estimates {
+                if let Some(object) = windows.get_mut(index).and_then(Value::as_object_mut) {
+                    object.insert("runoutEstimate".into(), Value::String(estimate));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Persist one observation; a DB error is returned rather than silently dropping usage.
@@ -500,6 +750,110 @@ mod tests {
         }
     }
 
+    fn quota_value(remaining: f64) -> Value {
+        json!({
+            "planType":"individual",
+            "tokenBasedBilling":false,
+            "windows":[{
+                "id":"copilot:premium_interactions",
+                "name":"Premium",
+                "unit":"requests",
+                "limit":1000,
+                "remaining":remaining,
+                "resetDate":"2026-12-01"
+            }]
+        })
+    }
+
+    #[test]
+    fn quota_runout_uses_multi_day_samples_persisted_across_reopen() -> Result<()> {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+        let dir = std::env::temp_dir().join(format!(
+            "copilot-rust-quota-samples-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("usage.sqlite");
+        let start_ms = 1_800_000_000_000_i64;
+        {
+            let store = UsageStore::open(&path)?;
+            for (day, remaining) in [(0, 1000.0), (1, 900.0), (2, 800.0)] {
+                let mut quota = quota_value(remaining);
+                store.record_quota_snapshots_at(&mut quota, start_ms + day * DAY_MS)?;
+                let expected = if day < 2 {
+                    "collecting samples"
+                } else {
+                    "~8d 0h"
+                };
+                assert_eq!(quota["windows"][0]["runoutEstimate"], expected);
+            }
+        }
+        {
+            let store = UsageStore::open(&path)?;
+            let mut quota = quota_value(700.0);
+            store.record_quota_snapshots_at(&mut quota, start_ms + 3 * DAY_MS)?;
+            assert_eq!(quota["windows"][0]["runoutEstimate"], "~7d 0h");
+
+            // Samples older than the seven-day lookback are discarded when
+            // the next quota reading arrives.
+            let mut aged = quota_value(600.0);
+            store.record_quota_snapshots_at(&mut aged, start_ms + 10 * DAY_MS)?;
+            assert_eq!(aged["windows"][0]["runoutEstimate"], "collecting samples");
+            let db = store.lock()?;
+            let count: i64 =
+                db.query_row("SELECT count(*) FROM rust_quota_snapshots", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(count, 2);
+            drop(db);
+
+            // A top-up clears the previous trend instead of treating it as
+            // a negative drawdown or carrying its stale ETA forward.
+            let mut topped_up = quota_value(900.0);
+            store.record_quota_snapshots_at(
+                &mut topped_up,
+                start_ms + 10 * DAY_MS + QUOTA_SAMPLE_BUCKET_MS,
+            )?;
+            assert_eq!(
+                topped_up["windows"][0]["runoutEstimate"],
+                "collecting samples"
+            );
+            let db = store.lock()?;
+            let count: i64 =
+                db.query_row("SELECT count(*) FROM rust_quota_snapshots", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(count, 1);
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn quota_samples_replace_each_five_minute_bucket_and_handle_special_windows() -> Result<()> {
+        let store = UsageStore::in_memory()?;
+        let start_ms = 1_800_000_000_000_i64;
+        let mut first = quota_value(100.0);
+        store.record_quota_snapshots_at(&mut first, start_ms)?;
+        let mut same_bucket = quota_value(95.0);
+        store.record_quota_snapshots_at(&mut same_bucket, start_ms + 60_000)?;
+        let db = store.lock()?;
+        let count: i64 = db.query_row("SELECT count(*) FROM rust_quota_snapshots", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 1);
+        drop(db);
+
+        let mut special = json!({"windows":[
+            {"id":"unlimited","unlimited":true},
+            {"id":"unknown"}
+        ]});
+        store.record_quota_snapshots_at(&mut special, start_ms + 5 * 60 * 1000)?;
+        assert_eq!(special["windows"][0]["runoutEstimate"], "unlimited");
+        assert_eq!(special["windows"][1]["runoutEstimate"], "unavailable");
+        Ok(())
+    }
+
     #[test]
     fn aggregates_models_sessions_and_times() -> Result<()> {
         let store = UsageStore::in_memory()?;
@@ -798,6 +1152,14 @@ mod tests {
         }
         {
             let store = UsageStore::open(&path)?;
+            let db = store.lock()?;
+            let table_count: i64 = db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='rust_quota_snapshots'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(table_count, 1);
+            drop(db);
             let old = store.events("lifetime", 1, 20)?;
             assert_eq!(old["items"][0]["model"], "old-model");
             assert_eq!(old["items"][0]["token_details"], Value::Null);

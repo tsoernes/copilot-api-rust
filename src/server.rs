@@ -329,7 +329,27 @@ async fn subscription_usage(
         return error(StatusCode::SERVICE_UNAVAILABLE, "Usage is unavailable");
     };
     match quota.fetch_normalized().await {
-        Ok(value) => ([(header::CACHE_CONTROL, "no-store")], axum::Json(value)).into_response(),
+        Ok(value) => {
+            let value = if let Some(usage) = state.usage.clone() {
+                let fallback = value.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mut value = value;
+                    usage.record_quota_snapshots(&mut value)?;
+                    Ok::<_, anyhow::Error>(value)
+                })
+                .await
+                {
+                    Ok(Ok(value)) => value,
+                    _ => {
+                        tracing::warn!("Could not persist quota samples; omitting runout estimate");
+                        fallback
+                    }
+                }
+            } else {
+                value
+            };
+            ([(header::CACHE_CONTROL, "no-store")], axum::Json(value)).into_response()
+        }
         Err(_) => (
             StatusCode::BAD_GATEWAY,
             axum::Json(json!({"error":"Failed to fetch subscription usage"})),
@@ -761,6 +781,7 @@ mod tests {
             )
             .unwrap(),
         ));
+        state.usage = Some(Arc::new(UsageStore::in_memory().unwrap()));
         let app = build_router(state);
         let request = |path: &str, key: Option<&str>| {
             let mut r = Request::builder()
@@ -797,6 +818,10 @@ mod tests {
         let normalized: Value =
             serde_json::from_slice(&to_bytes(normalized.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(normalized["windows"][0]["usedPercent"], 25.0);
+        assert_eq!(
+            normalized["windows"][0]["runoutEstimate"],
+            "collecting samples"
+        );
         assert_eq!(
             app.oneshot(request("/usage/other", Some("client-key")))
                 .await

@@ -20,7 +20,7 @@
 - Avoid local request-size rejection so the remote Copilot API decides whether a valid oversized request is acceptable. (User, 2026-11-21.)
 - (Superseded 2026-11-21) The earlier request was to reduce unnecessary large-request copies while preserving a 16 MiB request limit. The user later explicitly asked that oversized requests be left for the remote API to judge.
 - The quota view should show used, allowance and remaining credit amounts, not only percentages. Make changing “Usage billed to” between personal and organization accounts and between organizations possible if supported. (User, 2026-11-20.)
-- Estimate time to quota exhaustion using recent usage. (User, 2026-11-22.)
+- Estimate time to quota exhaustion using recent usage. Store quota-balance samples in the durable usage database so estimates can use multi-day history and survive restarts. (User, 2026-11-22; persistence and longer history clarified 2026-11-22.)
 - When GitHub supplies both rounded `remaining` and precise `quota_remaining`, show one consolidated Remaining value, preferring the precise reported quantity. (User, 2026-11-21.)
 - If supported, provide optional automatic billing-account switching when a stream reports monthly quota exhaustion. It must be off by default, restricted to a user-selected ordered allowlist, and automatically retry the failed request once after switching. (User, 2026-11-20.)
 - Display token and other count quantities using thousands/millions-style units (K, M, etc.). (User, 2026-11-20.)
