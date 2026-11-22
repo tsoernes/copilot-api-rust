@@ -1,14 +1,14 @@
 # Terminal monitor screenshot gallery
 
-These images render the actual Ratatui monitor UI with **synthetic sample data**. They were generated from a local `TestBackend` fixture; they are not screenshots of a signed-in account. No GitHub quota, private usage history, credentials, or live API responses are shown.
+The **Overview** image is the user's saved screenshot from a signed-in monitor session. It shows reported request/token totals and estimated costs as they appeared at capture time; it does not show prompts or credentials. The other five panes are synthetic `TestBackend` renders and are not screenshots of a signed-in account.
 
-The preview in the [repository README](../README.md) links here. Panes are rendered at 150 × 38 terminal cells; Catalog uses 150 × 44 so the long-context prices are visible. The status line marks the data as synthetic.
+The preview in the [repository README](../README.md) links here. The five synthetic panes were rendered at 150 × 38 terminal cells; Catalog uses 150 × 44 so the long-context prices are visible. Their status lines mark the data as synthetic.
 
-Overview, Models, and Sessions summarize 24 synthetic usage events. The Requests image shows only three illustrative recent rows to keep the view legible; those visible rows are not the complete source for the aggregate totals.
+In the synthetic samples, Models and Sessions summarize 24 events. The Requests image shows only three illustrative recent rows to keep the view legible; those rows are not a complete reconstruction of the sample aggregates or the live Overview values.
 
 ## Overview
 
-![Overview pane showing synthetic request, token, cost, cache, rolling-window, and daily-token figures](../assets/screenshots/overview.png)
+![Saved live Overview pane showing reported request/token totals, estimated costs, and rolling-window table](../assets/screenshots/overview.png)
 
 ## Quota
 

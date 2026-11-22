@@ -7,9 +7,9 @@ WebSockets, administration, plugins, and desktop features are not implemented.
 See [the compatibility notes](RUST_GUIDE.md#current-scope-and-known-gaps)
 before using it.
 
-[![Overview of the Rust terminal monitor — synthetic sample data](assets/screenshots/overview.png)](docs/monitor-gallery.md)
+[![Live overview of the Rust terminal monitor](assets/screenshots/overview.png)](docs/monitor-gallery.md)
 
-[View the screenshot gallery of all six monitor panes](docs/monitor-gallery.md) · synthetic sample data
+[View the screenshot gallery of all six monitor panes](docs/monitor-gallery.md) · overview is a saved live capture; other panes use synthetic data
 
 ## What this provides from Copilot API
 
