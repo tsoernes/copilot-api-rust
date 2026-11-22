@@ -12,6 +12,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 #[derive(Parser)]
@@ -82,6 +83,10 @@ async fn main() -> Result<()> {
             if !listen.ip().is_loopback() && api_key.is_none() {
                 bail!("a client API key is required when listening on a non-loopback address");
             }
+            let endpoint = local_endpoint(listen);
+            if monitoring && wait_for_existing_gateway(listen).await.is_some() {
+                return run_attached_monitor(&endpoint, api_key, logs).await;
+            }
             let token = github.resolve_github_token()?.context(
                 "no GitHub token; run `copilot-api-rust auth` or set COPILOT_API_GITHUB_TOKEN",
             )?;
@@ -91,15 +96,22 @@ async fn main() -> Result<()> {
             let usage =
                 Arc::new(UsageStore::open(&db_path).context("opening Rust usage database")?);
             let app = server::router(auth, api_key.clone(), quota, usage)?;
-            let listener = tokio::net::TcpListener::bind(listen).await?;
+            let listener = match tokio::net::TcpListener::bind(listen).await {
+                Ok(listener) => listener,
+                Err(error) if monitoring && error.kind() == std::io::ErrorKind::AddrInUse => {
+                    if wait_for_existing_gateway(listen).await.is_some() {
+                        return run_attached_monitor(&endpoint, api_key, logs).await;
+                    }
+                    return Err(error).with_context(|| {
+                        format!(
+                            "cannot monitor {endpoint}: the address is in use, but no Copilot API Rust health endpoint was found"
+                        )
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            };
             if monitoring {
-                let address = listener.local_addr()?;
-                let ip = match address.ip() {
-                    IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-                    ip => ip,
-                };
-                let endpoint = format!("http://{}", SocketAddr::new(ip, address.port()));
+                let endpoint = local_endpoint(listener.local_addr()?);
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
                 let mut server_task = tokio::spawn(async move {
                     axum::serve(listener, app)
@@ -108,7 +120,7 @@ async fn main() -> Result<()> {
                         })
                         .await
                 });
-                let result = monitor::run(&endpoint, api_key, &mut server_task, logs).await;
+                let result = monitor::run(&endpoint, api_key, &mut server_task, logs, false).await;
                 let _ = shutdown_tx.send(());
                 if !server_task.is_finished() {
                     // Bound shutdown time if clients hold long-running streams open.
@@ -150,4 +162,95 @@ fn usage_db_path() -> Result<PathBuf> {
             .join(".local/share/copilot-api"),
     };
     Ok(home.join("rust-usage.sqlite3"))
+}
+
+fn local_endpoint(listen: SocketAddr) -> String {
+    let ip = match listen.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!("http://{}", SocketAddr::new(ip, listen.port()))
+}
+
+async fn wait_for_existing_gateway(listen: SocketAddr) -> Option<String> {
+    if listen.port() == 0 {
+        return None;
+    }
+    let endpoint = local_endpoint(listen);
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(250))
+        .timeout(Duration::from_millis(500))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+
+    for attempt in 0..5 {
+        if is_copilot_api_rust(&client, &endpoint).await {
+            return Some(endpoint);
+        }
+        if attempt < 4 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+    None
+}
+
+async fn is_copilot_api_rust(client: &reqwest::Client, endpoint: &str) -> bool {
+    let Ok(response) = client.get(format!("{endpoint}/health")).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    response
+        .headers()
+        .get("x-copilot-api-service")
+        .and_then(|value| value.to_str().ok())
+        == Some("copilot-api-rust")
+}
+
+async fn run_attached_monitor(
+    endpoint: &str,
+    api_key: Option<String>,
+    logs: MemoryLog,
+) -> Result<()> {
+    let mut no_owned_server =
+        tokio::spawn(async { std::future::pending::<std::io::Result<()>>().await });
+    let result = monitor::run(endpoint, api_key, &mut no_owned_server, logs, true).await;
+    no_owned_server.abort();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, routing::get};
+
+    #[test]
+    fn monitor_endpoint_uses_loopback_for_wildcard_listeners() {
+        assert_eq!(
+            local_endpoint("0.0.0.0:4141".parse().unwrap()),
+            "http://127.0.0.1:4141"
+        );
+        assert_eq!(
+            local_endpoint("[::]:4141".parse().unwrap()),
+            "http://[::1]:4141"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_recognizes_only_the_copilot_api_health_marker() {
+        let app = Router::new().route(
+            "/health",
+            get(|| async { ([("x-copilot-api-service", "copilot-api-rust")], "ok") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = format!("http://{address}");
+        let client = reqwest::Client::new();
+        assert!(is_copilot_api_rust(&client, &endpoint).await);
+        server.abort();
+    }
 }

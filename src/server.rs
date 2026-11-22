@@ -10,7 +10,7 @@ use axum::{
     Router,
     body::{Body, to_bytes},
     extract::{Path, Query, Request, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -105,6 +105,7 @@ pub(crate) fn router_with_test_usage(
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(|| async { "copilot-api-rust (partial port)" }))
+        .route("/health", get(health))
         .route("/usage-viewer", get(usage_viewer))
         .route("/usage-viewer/", get(usage_viewer))
         .route("/usage", get(account_usage))
@@ -128,6 +129,16 @@ fn build_router(state: AppState) -> Router {
             protect_browser_access,
         ))
         .with_state(state)
+}
+
+async fn health() -> Response {
+    let mut response =
+        axum::Json(json!({"service":"copilot-api-rust","status":"ok"})).into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("x-copilot-api-service"),
+        HeaderValue::from_static("copilot-api-rust"),
+    );
+    response
 }
 
 impl AppState {
@@ -704,6 +715,31 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn health_reports_service_identity_without_client_auth() {
+        let app = router_with_test_credential("http://127.0.0.1:1".into(), "unused".into(), None)
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-copilot-api-service"],
+            "copilot-api-rust"
+        );
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(value["service"], "copilot-api-rust");
+        assert_eq!(value["status"], "ok");
+    }
 
     #[tokio::test]
     async fn quota_routes_require_auth_and_use_github_token() {

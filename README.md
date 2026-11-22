@@ -28,11 +28,18 @@ cargo build --locked --release
 ./target/release/copilot-api-rust monitor
 ```
 
-The monitor starts the API server and terminal dashboard together. The server
-listens on `127.0.0.1:4141` by default. GitHub device sign-in stores credentials
+The monitor opens the terminal dashboard and reuses a matching server if one
+is already running; otherwise it starts its own. The server listens on
+`127.0.0.1:4141` by default. GitHub device sign-in stores credentials
 in the user data directory; alternatively set `COPILOT_API_GITHUB_TOKEN`.
 An active GitHub Copilot entitlement is required. Protect credentials and
 usage data; do not expose the service to an untrusted network.
+
+When a matching server is already running, `monitor` attaches to it instead of
+trying to bind a second listener. Quitting an attached dashboard leaves that
+server running; a server started by `monitor` itself is stopped when its
+dashboard exits. See the [user service setup](RUST_GUIDE.md#systemd-user-service)
+to start the API automatically at login.
 
 ## Why Rust, and memory use
 

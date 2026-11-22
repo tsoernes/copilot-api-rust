@@ -1,0 +1,18 @@
+[Unit]
+Description=GitHub Copilot API Rust gateway
+Documentation=https://github.com/tsoernes/copilot-api-rust
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/copilot-api-rust serve
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=15s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=RUST_LOG=info
+EnvironmentFile=-%h/.config/copilot-api-rust/environment
+
+[Install]
+WantedBy=default.target

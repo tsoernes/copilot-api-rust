@@ -866,12 +866,14 @@ pub async fn run(
     api_key: Option<String>,
     server: &mut JoinHandle<io::Result<()>>,
     logs: MemoryLog,
+    attached: bool,
 ) -> Result<()> {
     let client = MonitorClient::new(endpoint, api_key)?;
     let mut screen = Screen::enter()?;
     let mut app = App {
         page: 1,
         session_page: 1,
+        notice: attached.then(|| "attached to existing server · q leaves service running".into()),
         ..App::default()
     };
     let mut input = EventStream::new();

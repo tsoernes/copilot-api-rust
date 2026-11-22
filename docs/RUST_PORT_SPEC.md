@@ -14,6 +14,7 @@
 - Describe the basic Copilot API functionality this Rust implementation does provide in the README, and explain Rust as a memory-usage motivation. (User, 2026-11-21.)
 - Refresh GitHub quota every 60 seconds and on manual refresh, while local statistics refresh every five seconds. (User, 2026-11-20.)
 - Stop the server started by the dashboard when the dashboard is quit. (User, 2026-11-20.)
+- Provide an automatically started user service for the API, and make `monitor` attach to an already-running instance rather than starting a duplicate. (User, 2026-11-22.)
 - The terminal request display should provide the most fine-grained token breakdown possible, rather than only a single total. The user reports that many requests appear incorrectly as cancelled; investigate and correct the classification. (User, 2026-11-20.)
 - The terminal monitor should show session statistics and request, token and cost counters per minute, hour and day, globally and per session. Global usage should persist across sessions and server restarts. (User, 2026-11-20.)
 - Avoid local request-size rejection so the remote Copilot API decides whether a valid oversized request is acceptable. (User, 2026-11-21.)

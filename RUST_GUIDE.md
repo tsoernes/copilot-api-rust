@@ -20,9 +20,26 @@ cargo build --locked --release
 
 The server defaults to `127.0.0.1:4141`. Configure `COPILOT_API_KEY` to require client `Authorization: Bearer ...` or `x-api-key` and to permit a non-loopback listen address, e.g. `serve --listen 0.0.0.0:4141`. The server does **not** provide TLS: use a trusted TLS-terminating reverse proxy for remote access. The health root requires no key. Browser Origin requests are rejected; without a key, Host must be loopback. POST requests require `application/json`. Do not expose the service directly on an untrusted network.
 
+## systemd user service
+
+The repository includes [`systemd/copilot-api-rust.service`](systemd/copilot-api-rust.service). To install and enable it for this checkout, run these commands from the repository root:
+
+```fish
+mkdir -p $HOME/.local/bin $HOME/.config/systemd/user
+ln -sfn (pwd)/target/release/copilot-api-rust $HOME/.local/bin/copilot-api-rust
+install -m 0644 systemd/copilot-api-rust.service $HOME/.config/systemd/user/copilot-api-rust.service
+systemctl --user daemon-reload
+systemctl --user enable --now copilot-api-rust.service
+systemctl --user status copilot-api-rust.service
+```
+
+The user service starts the API at login and restarts it after failures. It runs as your user, binds to loopback by default, and logs to the user journal. To stop and disable automatic startup, run `systemctl --user disable --now copilot-api-rust.service`. To inspect logs, use `journalctl --user -u copilot-api-rust.service`.
+
+If the service uses `COPILOT_API_KEY`, place it in `$HOME/.config/copilot-api-rust/environment` with owner-only permissions and provide the same key to the `monitor` command. The service file reads that environment file if it exists. No key is required for the default loopback-only setup.
+
 ## Terminal monitor
 
-After signing in, run `./target/release/copilot-api-rust monitor` in an interactive terminal. This starts its own server and dashboard together; quitting the dashboard also stops that server. Use `--listen` and `COPILOT_API_KEY` as with `serve`; the monitor connects locally to its own listener, so it accepts loopback or wildcard listen addresses. The existing `serve` command runs without a TUI. Recent server errors are shown in the dashboard instead of being printed over it.
+After signing in, run `./target/release/copilot-api-rust monitor` in an interactive terminal. If a matching server is already listening at the requested address, the dashboard attaches to it without starting another listener. Quitting an attached dashboard leaves the external server running. If no server exists, `monitor` starts its own server and stops it when the dashboard exits. Use `--listen` and `COPILOT_API_KEY` as with `serve`; the monitor uses loopback to reach its server. The `serve` command runs without a TUI. Recent server errors are shown in the dashboard instead of being printed over it.
 
 - `1`–`6` or Tab: overview, Copilot quota, per-model usage, recent requests, sessions and the available-model catalog.
 - `p`: change period; `↑`/`↓` or `j`/`k`: select/scroll models, requests or sessions; `←`/`→`: change request/session page. In Requests, `d` opens or closes the selected request's detailed token breakdown; scroll within it with `↑`/`↓`.
