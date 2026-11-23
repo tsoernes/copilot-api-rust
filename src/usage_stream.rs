@@ -59,32 +59,38 @@ impl UsageStream {
                 "Copilot reported monthly quota exhausted; automatic payer switching is unavailable. Use Quota > b to open GitHub billing settings."
             );
         }
-        let Some(observed) = observer.finish() else {
+        let mut observed = observer.finish();
+        if observed.is_none() && disposition != "error" && self.http_success {
             return;
-        };
+        }
         let Some(mut event) = self.event.take() else {
             return;
         };
-        event.input_tokens = observed.input_tokens.unwrap_or(0);
-        event.output_tokens = observed.output_tokens.unwrap_or(0);
-        event.cache_read_input_tokens = observed.cache_read_input_tokens.unwrap_or(0);
-        event.cache_creation_input_tokens = observed.cache_creation_input_tokens.unwrap_or(0);
-        event.total_tokens = observed.total_tokens.unwrap_or_else(|| {
-            event
-                .input_tokens
-                .saturating_add(event.output_tokens)
-                .saturating_add(event.cache_read_input_tokens)
-                .saturating_add(event.cache_creation_input_tokens)
-        });
-        event.total_nano_aiu = observed.total_nano_aiu;
-        if !observed.token_details.is_empty() {
-            event.token_details = Some(observed.token_details);
+        let protocol_error = observed
+            .as_ref()
+            .is_some_and(|observed| observed.protocol_error);
+        if let Some(observed) = observed.take() {
+            event.input_tokens = observed.input_tokens.unwrap_or(0);
+            event.output_tokens = observed.output_tokens.unwrap_or(0);
+            event.cache_read_input_tokens = observed.cache_read_input_tokens.unwrap_or(0);
+            event.cache_creation_input_tokens = observed.cache_creation_input_tokens.unwrap_or(0);
+            event.total_tokens = observed.total_tokens.unwrap_or_else(|| {
+                event
+                    .input_tokens
+                    .saturating_add(event.output_tokens)
+                    .saturating_add(event.cache_read_input_tokens)
+                    .saturating_add(event.cache_creation_input_tokens)
+            });
+            event.total_nano_aiu = observed.total_nano_aiu;
+            if !observed.token_details.is_empty() {
+                event.token_details = Some(observed.token_details);
+            }
+            event.first_token_ms = observed.first_token_ms;
         }
-        event.first_token_ms = observed.first_token_ms;
         event.duration_ms =
             Some(i64::try_from(self.start.elapsed().as_millis()).unwrap_or(i64::MAX));
         event.request_outcome = Some(
-            if disposition == "error" || observed.protocol_error || !self.http_success {
+            if disposition == "error" || protocol_error || !self.http_success {
                 "error"
             } else if terminal == Some(StreamTerminal::Incomplete) {
                 "incomplete"
@@ -141,6 +147,29 @@ impl Stream for UsageStream {
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(error))) => {
+                let request_id = self
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.request_id.as_deref())
+                    .unwrap_or("unknown");
+                let endpoint = self
+                    .event
+                    .as_ref()
+                    .map(|event| event.endpoint.as_str())
+                    .unwrap_or("unknown");
+                let error_class = if error.is_timeout() {
+                    "timeout"
+                } else if error.is_connect() {
+                    "connect"
+                } else {
+                    "stream"
+                };
+                tracing::error!(
+                    request_id,
+                    endpoint,
+                    error_class,
+                    "Copilot response stream failed"
+                );
                 self.save("error");
                 self.done = true;
                 Poll::Ready(Some(Err(error)))
@@ -329,5 +358,49 @@ mod tests {
             let events = store.events("lifetime", 1, 10).unwrap();
             assert_eq!(events["items"][0]["request_outcome"], outcome);
         }
+    }
+
+    #[tokio::test]
+    async fn non_success_without_usage_is_recorded_as_error() {
+        let store = Arc::new(UsageStore::in_memory().unwrap());
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            b"upstream unavailable",
+        ))]);
+        let event = UsageEvent {
+            endpoint: "responses".into(),
+            model: "mock".into(),
+            request_id: Some("failed-response".into()),
+            ..UsageEvent::default()
+        };
+        let mut observed =
+            UsageStream::new(source, store.clone(), event, false, Instant::now(), false);
+        while observed.next().await.is_some() {}
+
+        let events = store.events("lifetime", 1, 10).unwrap();
+        assert_eq!(events["total"], 1);
+        assert_eq!(events["items"][0]["request_outcome"], "error");
+        assert_eq!(events["items"][0]["total_tokens"], 0);
+        assert_eq!(events["items"][0]["request_id"], "failed-response");
+    }
+
+    #[tokio::test]
+    async fn protocol_error_without_usage_is_recorded_as_error() {
+        let store = Arc::new(UsageStore::in_memory().unwrap());
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            br#"{"error":{"message":"failed"}}"#,
+        ))]);
+        let event = UsageEvent {
+            endpoint: "responses".into(),
+            model: "mock".into(),
+            ..UsageEvent::default()
+        };
+        let mut observed =
+            UsageStream::new(source, store.clone(), event, false, Instant::now(), true);
+        while observed.next().await.is_some() {}
+
+        let events = store.events("lifetime", 1, 10).unwrap();
+        assert_eq!(events["total"], 1);
+        assert_eq!(events["items"][0]["request_outcome"], "error");
+        assert_eq!(events["items"][0]["total_tokens"], 0);
     }
 }

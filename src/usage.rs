@@ -28,6 +28,13 @@ struct QuotaSnapshotPoint {
 }
 
 #[derive(Debug)]
+struct QuotaRunout {
+    estimate: String,
+    sample_span_ms: Option<i64>,
+    sample_count: usize,
+}
+
+#[derive(Debug)]
 struct QuotaWindowSnapshot {
     index: usize,
     key: Option<String>,
@@ -114,36 +121,47 @@ fn quota_snapshot_key(
     Ok((key.len() <= MAX_QUOTA_WINDOW_KEY_BYTES).then_some(key))
 }
 
-fn estimate_quota_runout(points: &[QuotaSnapshotPoint], remaining: f64) -> String {
+fn estimate_quota_runout(points: &[QuotaSnapshotPoint], remaining: f64) -> QuotaRunout {
+    let sample_span_ms = points
+        .first()
+        .zip(points.last())
+        .map(|(first, last)| last.observed_at_ms.saturating_sub(first.observed_at_ms))
+        .filter(|span| *span > 0);
+    let sample_count = points.len();
+    let result = |estimate: &str| QuotaRunout {
+        estimate: estimate.to_owned(),
+        sample_span_ms,
+        sample_count,
+    };
     if !remaining.is_finite() {
-        return "unavailable".into();
+        return result("unavailable");
     }
     if remaining <= 0.0 {
-        return "already depleted".into();
+        return result("already depleted");
     }
     if points.len() < 3 {
-        return "collecting samples".into();
+        return result("collecting samples");
     }
     let Some(first) = points.first() else {
-        return "collecting samples".into();
+        return result("collecting samples");
     };
     let Some(last) = points.last() else {
-        return "collecting samples".into();
+        return result("collecting samples");
     };
     let elapsed_ms = last.observed_at_ms.saturating_sub(first.observed_at_ms);
     if elapsed_ms < QUOTA_RUNOUT_MIN_SPAN_MS {
-        return "collecting samples".into();
+        return result("collecting samples");
     }
     let decline = first.remaining - last.remaining;
     if decline <= 0.0 {
-        return "no drawdown".into();
+        return result("no drawdown");
     }
     let seconds = remaining * (elapsed_ms as f64 / 1000.0) / decline;
     if !seconds.is_finite() || seconds > 10.0 * 365.0 * 24.0 * 60.0 * 60.0 {
-        return ">10y".into();
+        return result(">10y");
     }
     let minutes = (seconds / 60.0).ceil() as u64;
-    if minutes == 0 {
+    let estimate = if minutes == 0 {
         "<1m".into()
     } else if minutes < 60 {
         format!("~{minutes}m")
@@ -151,6 +169,11 @@ fn estimate_quota_runout(points: &[QuotaSnapshotPoint], remaining: f64) -> Strin
         format!("~{}h {}m", minutes / 60, minutes % 60)
     } else {
         format!("~{}d {}h", minutes / (24 * 60), (minutes / 60) % 24)
+    };
+    QuotaRunout {
+        estimate,
+        sample_span_ms,
+        sample_count,
     }
 }
 
@@ -359,7 +382,11 @@ impl UsageStore {
                         [key],
                     )?;
                 }
-                "unlimited".to_owned()
+                QuotaRunout {
+                    estimate: "unlimited".into(),
+                    sample_span_ms: None,
+                    sample_count: 0,
+                }
             } else if let (Some(key), Some(remaining)) = (snapshot.key, snapshot.remaining) {
                 let previous: Option<f64> = tx
                     .query_row(
@@ -403,7 +430,11 @@ impl UsageStore {
                 };
                 estimate_quota_runout(&points, remaining)
             } else {
-                "unavailable".to_owned()
+                QuotaRunout {
+                    estimate: "unavailable".into(),
+                    sample_span_ms: None,
+                    sample_count: 0,
+                }
             };
             estimates.push((snapshot.index, estimate));
         }
@@ -412,7 +443,20 @@ impl UsageStore {
         if let Some(windows) = quota.get_mut("windows").and_then(Value::as_array_mut) {
             for (index, estimate) in estimates {
                 if let Some(object) = windows.get_mut(index).and_then(Value::as_object_mut) {
-                    object.insert("runoutEstimate".into(), Value::String(estimate));
+                    object.insert("runoutEstimate".into(), Value::String(estimate.estimate));
+                    if let Some(span_ms) = estimate.sample_span_ms {
+                        object.insert("runoutEstimateSampleSpanMs".into(), json!(span_ms));
+                    } else {
+                        object.remove("runoutEstimateSampleSpanMs");
+                    }
+                    if estimate.sample_count > 0 {
+                        object.insert(
+                            "runoutEstimateSampleCount".into(),
+                            json!(estimate.sample_count),
+                        );
+                    } else {
+                        object.remove("runoutEstimateSampleCount");
+                    }
                 }
             }
         }
@@ -449,7 +493,10 @@ impl UsageStore {
                 Ok(json)
             })
             .transpose()?;
-        if numbers.iter().all(|&n| n == 0) && event.total_nano_aiu.is_none() {
+        if numbers.iter().all(|&n| n == 0)
+            && event.total_nano_aiu.is_none()
+            && event.request_outcome.as_deref() != Some("error")
+        {
             return Ok(());
         }
         if event.created_at_ms == 0 {
@@ -786,6 +833,13 @@ mod tests {
                     "~8d 0h"
                 };
                 assert_eq!(quota["windows"][0]["runoutEstimate"], expected);
+                if day == 2 {
+                    assert_eq!(
+                        quota["windows"][0]["runoutEstimateSampleSpanMs"],
+                        2 * DAY_MS
+                    );
+                    assert_eq!(quota["windows"][0]["runoutEstimateSampleCount"], 3);
+                }
             }
         }
         {
@@ -793,6 +847,11 @@ mod tests {
             let mut quota = quota_value(700.0);
             store.record_quota_snapshots_at(&mut quota, start_ms + 3 * DAY_MS)?;
             assert_eq!(quota["windows"][0]["runoutEstimate"], "~7d 0h");
+            assert_eq!(
+                quota["windows"][0]["runoutEstimateSampleSpanMs"],
+                3 * DAY_MS
+            );
+            assert_eq!(quota["windows"][0]["runoutEstimateSampleCount"], 4);
 
             // Samples older than the seven-day lookback are discarded when
             // the next quota reading arrives.
@@ -1075,6 +1134,25 @@ mod tests {
             store.summary("lifetime")?["totals"]["costs"][0]["total_cost_nanos"],
             0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_requests_are_recorded_without_inventing_usage() -> Result<()> {
+        let store = UsageStore::in_memory()?;
+        store.record(UsageEvent {
+            endpoint: "responses".into(),
+            model: "test-model".into(),
+            request_id: Some("failed-request".into()),
+            request_outcome: Some("error".into()),
+            ..Default::default()
+        })?;
+        let events = store.events("lifetime", 1, 10)?;
+        assert_eq!(events["total"], 1);
+        assert_eq!(events["items"][0]["request_outcome"], "error");
+        assert_eq!(events["items"][0]["total_tokens"], 0);
+        assert_eq!(store.summary("lifetime")?["totals"]["request_count"], 1);
+        assert_eq!(store.summary("lifetime")?["totals"]["total_tokens"], 0);
         Ok(())
     }
 

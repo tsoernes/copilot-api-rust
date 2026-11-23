@@ -659,6 +659,41 @@ fn overview(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     }
 }
 
+fn quota_runout_basis(window: &Value, estimate: &str) -> Option<String> {
+    let span_ms = window
+        .get("runoutEstimateSampleSpanMs")
+        .and_then(Value::as_i64)
+        .filter(|span| *span > 0)?;
+    let sample_count = window
+        .get("runoutEstimateSampleCount")
+        .and_then(Value::as_u64)?;
+    if sample_count == 0 {
+        return None;
+    }
+    let span = format_quota_sample_span(span_ms);
+    let sample_word = if sample_count == 1 {
+        "sample"
+    } else {
+        "samples"
+    };
+    if estimate.starts_with('~') || matches!(estimate, "<1m" | ">10y") {
+        Some(format!("based on {span} ({sample_count} {sample_word})"))
+    } else {
+        Some(format!("history: {span} ({sample_count} {sample_word})"))
+    }
+}
+
+fn format_quota_sample_span(span_ms: i64) -> String {
+    let minutes = span_ms.max(0) / 60_000;
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else if minutes < 24 * 60 {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!("{}d {}h", minutes / (24 * 60), (minutes / 60) % 24)
+    }
+}
+
 fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     let Some(windows) = view
         .quota
@@ -743,10 +778,13 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             .get("runoutEstimate")
             .and_then(Value::as_str)
             .unwrap_or("unavailable");
+        let basis = quota_runout_basis(window, runout)
+            .map(|basis| format!(" · {basis}"))
+            .unwrap_or_default();
         let remaining_line = if unlimited {
             format!("Remaining: {remaining}")
         } else {
-            format!("Remaining: {remaining} · ETA: {runout}")
+            format!("Remaining: {remaining} · ETA: {runout}{basis}")
         };
         let lines = vec![
             format!("{name} · {unit} · reset: {reset}"),
@@ -2194,7 +2232,9 @@ mod tests {
             "name":"Premium",
             "usedPercent":41.6,
             "remaining":100,
-            "runoutEstimate":"~2d 3h"
+            "runoutEstimate":"~2d 3h",
+            "runoutEstimateSampleSpanMs": 6 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000,
+            "runoutEstimateSampleCount": 84
         }]});
         let mut v = view(&null, &null, &null, &quota);
         v.tab = 1;
@@ -2202,7 +2242,7 @@ mod tests {
         terminal.draw(|f| render(f, &v)).unwrap();
         let display = render_text(&terminal);
         assert!(
-            display.contains("Remaining: 100 · ETA: ~2d 3h"),
+            display.contains("Remaining: 100 · ETA: ~2d 3h · based on 6d 2h (84 samples)"),
             "{display}"
         );
         assert!(display.contains("┌ Usage"), "{display}");

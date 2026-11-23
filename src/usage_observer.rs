@@ -168,7 +168,7 @@ impl UsageObserver {
         .flatten()
         .any(|value| value > 0)
             || self.usage.total_nano_aiu.is_some();
-        has_usage.then_some(self.usage)
+        (has_usage || self.usage.protocol_error).then_some(self.usage)
     }
 
     fn process_line(&mut self) {
@@ -610,7 +610,9 @@ mod tests {
         let mut observer = UsageObserver::new("messages", true, Instant::now());
         observer.observe(b"event: error\ndata: {\"type\":\"error\"}\n\n");
         assert!(observer.protocol_error());
-        assert_eq!(observer.finish(), None);
+        let observed = observer.finish().unwrap();
+        assert!(observed.protocol_error);
+        assert_eq!(observed.input_tokens, None);
         let mut observer = UsageObserver::new("responses", false, Instant::now());
         observer.observe(br#"{"usage":{"input_tokens":-3,"output_tokens":"42"}}"#);
         assert_eq!(observer.finish(), None);

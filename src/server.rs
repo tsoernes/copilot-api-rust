@@ -419,6 +419,25 @@ async fn query_usage(
     }
 }
 
+async fn record_failed_request(
+    usage: Option<Arc<UsageStore>>,
+    event: Option<UsageEvent>,
+    started: Instant,
+) {
+    let (Some(usage), Some(mut event)) = (usage, event) else {
+        return;
+    };
+    let request_id = event.request_id.clone().unwrap_or_default();
+    event.duration_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+    event.request_outcome = Some("error".into());
+    if !matches!(
+        tokio::task::spawn_blocking(move || usage.record(event)).await,
+        Ok(Ok(()))
+    ) {
+        tracing::error!(request_id = %request_id, "failed to persist failed Copilot request");
+    }
+}
+
 async fn token_summary(
     State(s): State<AppState>,
     h: HeaderMap,
@@ -607,17 +626,6 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         model,
         anthropic_beta,
     } = prepared;
-    let credential = match state.credential().await {
-        Ok(c) => c,
-        Err(_) => {
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "Could not obtain Copilot credentials",
-            );
-        }
-    };
-    // The base URL has been validated by the credential module; no client-supplied URL is used.
-    let url = format!("{}{}", credential.api_base.trim_end_matches('/'), path);
     let id = Uuid::new_v4().to_string();
     let started = Instant::now();
     let endpoint = match path.as_str() {
@@ -646,6 +654,24 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             ..UsageEvent::default()
         }
     });
+    let credential = match state.credential().await {
+        Ok(c) => c,
+        Err(_) => {
+            tracing::error!(
+                request_id = %id,
+                endpoint = %path,
+                elapsed_ms = started.elapsed().as_millis(),
+                "could not obtain Copilot credentials for upstream request"
+            );
+            record_failed_request(state.usage.clone(), event, started).await;
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "Could not obtain Copilot credentials",
+            );
+        }
+    };
+    // The base URL has been validated by the credential module; no client-supplied URL is used.
+    let url = format!("{}{}", credential.api_base.trim_end_matches('/'), path);
     let interaction = if path == "/models" {
         "model-access"
     } else {
@@ -686,8 +712,34 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     // legitimately remain open for much longer than this timeout.
     let upstream = match tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, upstream.send()).await {
         Ok(Ok(r)) => r,
-        Ok(Err(_)) => return error(StatusCode::BAD_GATEWAY, "Copilot request failed"),
+        Ok(Err(request_error)) => {
+            let error_class = if request_error.is_timeout() {
+                "timeout"
+            } else if request_error.is_connect() {
+                "connect"
+            } else {
+                "transport"
+            };
+            tracing::error!(
+                request_id = %id,
+                endpoint = %path,
+                error_class,
+                error = %request_error.without_url(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "Copilot upstream request failed before response headers"
+            );
+            record_failed_request(state.usage.clone(), event, started).await;
+            return error(StatusCode::BAD_GATEWAY, "Copilot request failed");
+        }
         Err(_) => {
+            tracing::error!(
+                request_id = %id,
+                endpoint = %path,
+                timeout_ms = RESPONSE_HEADERS_TIMEOUT.as_millis(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "Copilot response headers timed out"
+            );
+            record_failed_request(state.usage.clone(), event, started).await;
             return error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "Copilot response headers timed out",
@@ -695,6 +747,25 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         }
     };
     let status = upstream.status();
+    if !status.is_success() {
+        if status.is_server_error() {
+            tracing::error!(
+                request_id = %id,
+                endpoint = %path,
+                upstream_status = status.as_u16(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "Copilot returned a server error status"
+            );
+        } else {
+            tracing::warn!(
+                request_id = %id,
+                endpoint = %path,
+                upstream_status = status.as_u16(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "Copilot returned a non-success HTTP status"
+            );
+        }
+    }
     let sse = upstream
         .headers()
         .get(header::CONTENT_TYPE)
@@ -759,6 +830,41 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(value["service"], "copilot-api-rust");
         assert_eq!(value["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn upstream_transport_failure_is_logged_and_recorded_as_error() {
+        use axum::body::to_bytes;
+        use tower::ServiceExt;
+
+        let usage = Arc::new(UsageStore::in_memory().unwrap());
+        let app = router_with_test_usage("http://127.0.0.1:1".into(), None, usage.clone()).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header(header::HOST, "localhost:4141")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"test-model","input":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("Copilot request failed")
+        );
+
+        let events = usage.events("lifetime", 1, 10).unwrap();
+        assert_eq!(events["total"], 1);
+        assert_eq!(events["items"][0]["endpoint"], "responses");
+        assert_eq!(events["items"][0]["model"], "test-model");
+        assert_eq!(events["items"][0]["request_outcome"], "error");
+        assert_eq!(events["items"][0]["total_tokens"], 0);
     }
 
     #[tokio::test]
