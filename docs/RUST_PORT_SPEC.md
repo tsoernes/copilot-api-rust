@@ -31,10 +31,12 @@
 - The Models pane should show both per-token model unit prices and credits/AIU spent. Add a separate pane listing all Copilot-provided models and their information, with optional price sorting. Default to the highest available output-tier price first and keep missing or unverified prices visible last; offer other sort orders. (User, 2026-11-20; tier clarified 2026-11-21.)
 - The available-model catalog should be filterable by model name. (User, 2026-11-21.)
 - The model catalog sorting options should include long-context pricing. (User, 2026-11-21.)
+- Add GitHub Copilot Fusion API support. (User, 2026-11-23.)
 
 ## Open questions
 
 - Should compact counts be the default with an exact-count toggle, always remain exact with suffixes, or be compact only? (Asked 2026-11-20.)
+- What public request surface, model identifier and effort-level fields should the gateway expose for Copilot Fusion? Official product documentation describes model routing/orchestration and client model-picker effort levels, but no public REST request contract has been established yet. (Investigation, 2026-11-23.)
 
 ## Implementation notes (not user requirements)
 
@@ -43,3 +45,4 @@
 - Upstream includes multiple providers, desktop and plugin integrations, administration, OAuth, streaming translations and many routes. These are not automatically implemented by a Copilot-only proxy.
 - Automatic payer switching and retry remain unresolved: no documented payer-selection API was found, and replay after forwarding part of a stream is not transparent. Opening GitHub settings is a manual alternative, not completion of the automatic requirement.
 - Output sorting uses the highest independently verified published output price across available tiers and marks incomplete comparisons; the catalog also offers a dedicated long-context-output sort.
+- GitHub's official [October 28, 2026 changelog](https://github.blog/changelog/2026-10-28-route-and-orchestrate-models-with-github-copilot-fusion/) describes Fusion as model routing/orchestration with Single, Cascade and Critique patterns; the [November 17, 2026 update](https://github.blog/changelog/2026-11-17-github-copilot-fusion-updates-more-availability-benchmarks-and-models/) adds client availability and model-pool updates. These posts do not define a standalone REST API contract. Do not equate Fusion with a single model ID or invent a request schema without further evidence.
