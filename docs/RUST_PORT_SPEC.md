@@ -36,7 +36,7 @@
 ## Open questions
 
 - Should compact counts be the default with an exact-count toggle, always remain exact with suffixes, or be compact only? (Asked 2026-11-20.)
-- What public request surface, model identifier and effort-level fields should the gateway expose for Copilot Fusion? Official product documentation describes model routing/orchestration and client model-picker effort levels, but no public REST request contract has been established yet. (Investigation, 2026-11-23.)
+- The observed GitHub web flow uses an undocumented `api.github.com/cmc_internal/api/agents/tasks` task API. The HAR did not preserve the Authorization value, and the request variants did not reveal how Fusion Standard/High/Max is selected. See [observed Fusion API notes](COPILOT_FUSION_API.md). Confirm supported auth and routing semantics before treating this internal API as a stable gateway contract. (Investigation, 2026-11-24.)
 
 ## Implementation notes (not user requirements)
 
