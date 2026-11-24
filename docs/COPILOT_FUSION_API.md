@@ -57,15 +57,25 @@ The reservation-shaped response included `reserved` and `reservation_expires_at`
 
 The task-detail schema included fields such as `status`, `state`, `compute`, `sessions`, `artifacts`, and timestamps. Session objects included `model` and `reasoning_effort` keys, but this capture did not establish usable values for those fields.
 
-The observed models response had 23 entries. Items exposed keys including `id`, `name`, `vendor`, `version`, `billing`, `capabilities`, `model_picker_enabled`, `model_picker_category`, and `supported_endpoints`; only the `auto` identifier is relevant to the captured Fusion request. Treat this list as account-/time-dependent, not a static catalog.
+The HAR's models response had 23 entries. A separate authenticated read-only GET on 2026-11-24 returned 18 models. Items exposed keys including `id`, `name`, `vendor`, `version`, `billing`, `capabilities`, `model_picker_enabled`, `model_picker_category`, and `supported_endpoints`; the list included `auto`. Counts are account-/time-dependent, not a static catalog.
 
 ## Authentication and compatibility gaps
 
 - CORS preflights listed `authorization`, `copilot-integration-id`, and `x-client-application` as requested headers. The observed request headers included `Copilot-Integration-Id: copilot-web` and `X-Client-Application: copilot-cloud-web`.
-- The exported HAR did not retain an Authorization value (and showed no Cookie header). The response included GitHub OAuth-related headers, but this does **not** prove which exact token type is accepted or whether the Rust gateway's stored GitHub token can call these routes.
-- The browser's selected Fusion Standard profile did not appear as a distinct field in the observed task-creation body. This leaves the mapping of Standard/High/Max effort unresolved.
-- These task endpoints can start remote coding-agent work. An implementation should keep task creation explicit, local-client-authenticated, and clearly experimental; it must not replay HAR requests or expose saved browser credentials.
+- A separate **read-only** GET of `https://api.enterprise.githubcopilot.com/agents/swe/models` with the project's stored GitHub OAuth token in a Bearer authorization header returned HTTP 200, `application/json`, and an `{ "object", "data" }` response with 18 models. The token value was not recorded. This verifies model-catalog authentication only.
+- The exported HAR did not retain the Authorization value for task/environment requests. Task list, task detail/events, environment detail/connect, and especially task-create authentication remain unverified. The experimental proxy currently uses the GitHub OAuth Bearer token and the observed integration headers for those routes; this is an implementation assumption, not a verified upstream contract. No live task-create POST was sent.
+- The browser's selected Fusion Standard profile did not appear as a distinct field in the observed task-creation body. The route does not add a model/effort field, so mapping Standard/High/Max remains unresolved.
+- These task endpoints can start remote coding-agent work. Task creation is an explicit POST only, requires a configured local `COPILOT_API_KEY`, uses fixed upstream hosts/paths, and does not retry or automatically create tasks. Request/response bodies and credentials are not logged.
 
 ## Implementation decision
 
-No Fusion route is implemented from this observation alone. Before adding a gateway route, verify the auth token type and effort selection with a documented contract or an explicitly approved, read-only-compatible test. If the eventual implementation forwards task-creation requests, preserve GitHub's auth boundaries and make the remote side effect explicit to the caller.
+The Rust gateway exposes the following **experimental** routes under `/experimental/fusion/`:
+
+| Local route | Upstream mapping |
+|---|---|
+| `GET /models` | Copilot credential's `api_base` + `/agents/swe/models`; GitHub OAuth Bearer token. This read-only auth path was verified. |
+| `GET, POST /tasks` | `https://api.github.com/cmc_internal/api/agents/tasks` |
+| `GET /tasks/{task_id}` and `GET /tasks/{task_id}/events` | Corresponding fixed `api.github.com/cmc_internal/api/agents/tasks/...` paths |
+| `GET /environments/{environment_id}` and `/connect` | Corresponding fixed `api.github.com/cmc_internal/api/agents/environments/...` paths |
+
+All local Fusion routes require `COPILOT_API_KEY`. Upstream task bodies must be JSON objects; the submitted bytes are passed through as `text/plain;charset=UTF-8` to match the browser observation. Queries are limited in size and forwarded only to the route's fixed host/path. Responses are streamed and upstream status codes are preserved. Mock-based tests verify request mapping and header handling; task-route authentication and Fusion effort selection are not verified. Do not treat this undocumented internal API as a stable or supported contract.

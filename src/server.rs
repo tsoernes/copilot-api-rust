@@ -32,15 +32,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
-struct AppState {
-    auth: Arc<CopilotAuth>,
-    client: reqwest::Client,
-    api_key: Option<String>,
+pub(crate) struct AppState {
+    pub(crate) auth: Arc<CopilotAuth>,
+    pub(crate) client: reqwest::Client,
+    pub(crate) api_key: Option<String>,
     device_id: String,
     quota: Option<Arc<QuotaClient>>,
     usage: Option<Arc<UsageStore>>,
     #[cfg(test)]
-    test_credential: Option<crate::auth::CopilotCredential>,
+    pub(crate) test_credential: Option<crate::auth::CopilotCredential>,
 }
 
 pub fn router(
@@ -124,6 +124,7 @@ fn build_router(state: AppState) -> Router {
         .route("/responses", post(proxy))
         .route("/v1/responses", post(proxy))
         .route("/v1/messages", post(proxy))
+        .merge(crate::fusion::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             protect_browser_access,
@@ -142,7 +143,7 @@ async fn health() -> Response {
 }
 
 impl AppState {
-    async fn credential(&self) -> Result<crate::auth::CopilotCredential> {
+    pub(crate) async fn credential(&self) -> Result<crate::auth::CopilotCredential> {
         #[cfg(test)]
         if let Some(credential) = &self.test_credential {
             return Ok(credential.clone());
@@ -258,7 +259,7 @@ fn anthropic_beta(headers: &HeaderMap, payload: &Value) -> Option<String> {
     None
 }
 
-fn authorized(headers: &HeaderMap, key: Option<&str>) -> bool {
+pub(crate) fn authorized(headers: &HeaderMap, key: Option<&str>) -> bool {
     let Some(key) = key else { return true };
     let bearer = headers
         .get(header::AUTHORIZATION)
@@ -271,7 +272,7 @@ fn authorized(headers: &HeaderMap, key: Option<&str>) -> bool {
         .any(|candidate| bool::from(candidate.as_bytes().ct_eq(key.as_bytes())))
 }
 
-fn error(status: StatusCode, message: &'static str) -> Response {
+pub(crate) fn error(status: StatusCode, message: &'static str) -> Response {
     (status, axum::Json(json!({"error": {"message": message}}))).into_response()
 }
 

@@ -36,7 +36,7 @@
 ## Open questions
 
 - Should compact counts be the default with an exact-count toggle, always remain exact with suffixes, or be compact only? (Asked 2026-11-20.)
-- The observed GitHub web flow uses an undocumented `api.github.com/cmc_internal/api/agents/tasks` task API. The HAR did not preserve the Authorization value, and the request variants did not reveal how Fusion Standard/High/Max is selected. See [observed Fusion API notes](COPILOT_FUSION_API.md). Confirm supported auth and routing semantics before treating this internal API as a stable gateway contract. (Investigation, 2026-11-24.)
+- The observed GitHub web flow uses an undocumented `api.github.com/cmc_internal/api/agents/tasks` task API. A read-only models-catalog GET was verified on 2026-11-24 with the stored GitHub OAuth Bearer token, but the HAR did not preserve Authorization for task/environment routes; task-route authentication and Fusion Standard/High/Max selection remain unverified. Experimental pass-through routes are implemented with those gaps documented; do not treat them as a stable gateway contract. See [observed Fusion API notes](COPILOT_FUSION_API.md). (Investigation, 2026-11-24.)
 
 ## Implementation notes (not user requirements)
 

@@ -17,6 +17,7 @@ before using it.
 - A basic proxy for `/models`, `/chat/completions`, `/embeddings`, and `/responses`, with `/v1` aliases, plus native `/v1/messages` pass-through. Upstream status codes and bodies are forwarded; response and SSE bodies are streamed. Model/route support depends on Copilot.
 - Local usage monitoring through both an HTTP viewer and a terminal dashboard. The monitor includes request, token, model, session, quota, and catalog views; reported usage is stored locally in SQLite and cost figures are estimates, not bills. The quota view estimates time to zero after observing a recent drop in GitHub-reported remaining balance; resets or usage changes can shift the estimate.
 - A model catalog fetched from Copilot’s `/models` endpoint, with name filtering, price sorting, and separately identified GitHub reference prices.
+- Experimental Fusion pass-through under `/experimental/fusion/*` for the model catalog, task list/create/detail/events, and environment detail/connect routes. Task creation is an explicit POST and requires `COPILOT_API_KEY`; this undocumented API has unverified task-route authentication and no verified Standard/High/Max effort mapping.
 
 This is the basic Copilot-focused subset currently implemented; it does not provide the original project's complete feature set.
 

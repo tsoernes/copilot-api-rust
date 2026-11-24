@@ -272,6 +272,13 @@ impl CopilotAuth {
         }
     }
 
+    /// Return the original GitHub OAuth credential for experimental endpoints
+    /// that use the signed-in GitHub identity. Never log or expose this value
+    /// in a response.
+    pub(crate) fn github_oauth_token(&self) -> &str {
+        &self.github_token
+    }
+
     async fn exchange(&self) -> std::result::Result<CachedCredential, ExchangeFailure> {
         let response = self
             .auth
