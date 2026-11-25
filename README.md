@@ -44,6 +44,17 @@ This is the basic Copilot-focused subset currently implemented; it does not prov
 
 ## Build and run
 
+Install the published crate:
+
+```fish
+cargo install copilot-api-rust
+```
+
+GitHub releases publish the corresponding crate version to crates.io after
+the release workflow passes formatting, tests, Clippy, and packaging checks.
+
+To build from this repository instead:
+
 ```fish
 cargo build --locked --release
 ./target/release/copilot-api-rust auth

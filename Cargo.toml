@@ -4,6 +4,18 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "A Rust Copilot-compatible API proxy for a limited subset of copilot-api"
+repository = "https://github.com/tsoernes/copilot-api-rust"
+documentation = "https://docs.rs/copilot-api-rust"
+readme = "README.md"
+keywords = ["copilot", "openai", "api", "gateway", "monitoring"]
+categories = ["command-line-utilities", "network-programming"]
+exclude = [
+    ".github/**",
+    "AGENTS.md",
+    "assets/screenshots/**",
+    "docs/**",
+    "target/**",
+]
 
 [dependencies]
 anyhow = "1"
