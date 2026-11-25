@@ -14,6 +14,8 @@ On 2026-11-25, this host measured the launcher's process-tree RSS after the
 same upstream `@jeffreycao/copilot-api@2.9.16` package (or the Rust binary) had
 been idle for three seconds on an isolated port:
 
+![Bar graph comparing idle process-tree RSS for npx, bunx, and Rust](assets/idle-rss-comparison.svg)
+
 | Launch | Process-tree RSS |
 | --- | ---: |
 | `npx --yes @jeffreycao/copilot-api@2.9.16 start` | **~307 MiB** |
