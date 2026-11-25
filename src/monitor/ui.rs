@@ -1007,10 +1007,11 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     let compact_required = groups
         .iter()
         .map(|(lines, unlimited, _, period)| {
+            let period_height = if period.is_some() { 3 } else { 0 };
             lines
                 .len()
                 .saturating_add(usize::from(!*unlimited))
-                .saturating_add(usize::from(period.is_some()))
+                .saturating_add(period_height)
         })
         .sum::<usize>()
         + usize::from(token_based);
@@ -1027,7 +1028,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             lines
                 .len()
                 .saturating_add(gauge_height)
-                .saturating_add(usize::from(period.is_some()))
+                .saturating_add(if period.is_some() { 3 } else { 0 })
         })
         .sum::<usize>()
         + usize::from(token_based);
@@ -1050,7 +1051,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             };
             [
                 Constraint::Length(u16::try_from(lines.len()).unwrap_or(u16::MAX)),
-                Constraint::Length(gauge_height + u16::from(period.is_some())),
+                Constraint::Length(gauge_height + if period.is_some() { 3 } else { 0 }),
             ]
         })
         .collect();
@@ -1077,7 +1078,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             1
         };
         let (usage_area, period_area) = if period_progress.is_some() {
-            let split = Layout::vertical([Constraint::Length(usage_height), Constraint::Length(1)])
+            let split = Layout::vertical([Constraint::Length(usage_height), Constraint::Length(3)])
                 .split(gauge_area);
             (split[0], Some(split[1]))
         } else {
@@ -1101,9 +1102,16 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
                     } else {
                         Block::default()
                     })
-                    .gauge_style(Style::default().fg(color))
+                    .style(Style::default().bg(Color::Black))
+                    .gauge_style(Style::default().fg(color).bg(Color::Black))
                     .ratio(clamped / 100.0)
-                    .label(format!("{used}% used")),
+                    .label(Span::styled(
+                        format!("{used}% used"),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )),
                 usage_area,
             );
         } else {
@@ -1112,11 +1120,19 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         if let (Some(progress), Some(period_area)) = (period_progress, period_area) {
             frame.render_widget(
                 Gauge::default()
-                    .gauge_style(Style::default().fg(ACCENT))
+                    .block(panel("Quota period · estimated"))
+                    .style(Style::default().bg(Color::Black))
+                    .gauge_style(Style::default().fg(ACCENT).bg(Color::Black))
                     .ratio(progress.ratio)
-                    .label(format!(
-                        "Cycle ~{}/{}d",
-                        progress.elapsed_days, progress.total_days
+                    .label(Span::styled(
+                        format!(
+                            "~{}/{}d elapsed",
+                            progress.elapsed_days, progress.total_days
+                        ),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     )),
                 period_area,
             );
@@ -1856,6 +1872,21 @@ mod tests {
         result
     }
 
+    fn assert_high_contrast_label(terminal: &Terminal<TestBackend>, display: &str, label: &str) {
+        let lines: Vec<_> = display.lines().collect();
+        let row = lines
+            .iter()
+            .position(|line| line.contains(label))
+            .expect("label should be visible");
+        let line = lines[row];
+        let byte_offset = line.find(label).unwrap();
+        let column = line[..byte_offset].chars().count() as u16;
+        let cell = &terminal.backend().buffer()[(column, row as u16)];
+        assert_eq!(cell.fg, Color::Black, "label should use dark foreground");
+        assert_eq!(cell.bg, Color::White, "label should have a light backdrop");
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
     #[test]
     fn displays_metrics_tabs_and_hides_credentials() {
         let summary = json!({"totals":{"total_tokens":42,"request_count":3,"input_tokens":30,"output_tokens":12,"cache_read_input_tokens":4,"cache_creation_input_tokens":2,"total_nano_aiu":100,"costs":[{"currency":"USD","amount":0.01}]},"byModel":[{"model":"gpt-thing","request_count":3,"total_tokens":42}]});
@@ -2473,7 +2504,8 @@ mod tests {
     #[test]
     fn quota_shows_runout_eta_in_the_boxed_usage_gauge() {
         let null = Value::Null;
-        let reset_at = Utc::now().timestamp() + 4 * 24 * 60 * 60;
+        let now_seconds = Utc::now().timestamp();
+        let reset_at = now_seconds + 4 * 24 * 60 * 60;
         let quota = json!({"windows":[{
             "name":"Premium",
             "usedPercent":41.6,
@@ -2494,6 +2526,7 @@ mod tests {
         );
         assert!(display.contains("┌ Usage"), "{display}");
         assert!(display.contains("41.6% used"), "{display}");
+        assert_high_contrast_label(&terminal, &display, "41.6% used");
         assert!(
             display.contains("Forecast vs refresh: Projected to run out before quota refresh")
                 || display.contains("before quota refresh"),
@@ -2512,11 +2545,22 @@ mod tests {
             .iter()
             .position(|line| line.contains("│└") && line.contains("┘│"))
             .unwrap_or_else(|| panic!("usage bar should be boxed: {display}"));
-        let period_bar = display_lines
+        let period_top = display_lines
             .iter()
-            .position(|line| line.contains("Cycle ~"))
-            .expect("period progress bar should be rendered");
-        assert_eq!(period_bar, usage_bottom + 1, "{display}");
+            .position(|line| line.contains("┌ Quota period · estimated"))
+            .expect("period progress bar should be boxed");
+        assert_eq!(period_top, usage_bottom + 1, "{display}");
+        let progress = quota_period_progress(reset_at, now_seconds).unwrap();
+        let period_label = format!(
+            "~{}/{}d elapsed",
+            progress.elapsed_days, progress.total_days
+        );
+        let period_label_row = display_lines
+            .iter()
+            .position(|line| line.contains(&period_label))
+            .expect("period progress label should be rendered");
+        assert_eq!(period_label_row, period_top + 1, "{display}");
+        assert_high_contrast_label(&terminal, &display, &period_label);
     }
 
     #[test]
