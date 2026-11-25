@@ -463,19 +463,19 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         ),
     }
     let controls = if view.tab == 1 {
-        " 1–6 Tab  u units  b billing settings  p period  r refresh  space pause  q quit"
+        " c sync Codex  1–6 Tab  u units  b billing settings  p period  r refresh  space pause  q quit"
     } else if view.tab == 5 {
-        " s sort  o order  u units  ↑/↓ model  Home/End  PgUp/PgDn details  r refresh  q quit"
+        " c sync Codex  s sort  o order  u units  ↑/↓ model  Home/End  PgUp/PgDn details  r refresh  q quit"
     } else if view.tab == 2 && view.show_model_detail {
-        " PgUp/PgDn scroll  d return  u units  q quit"
+        " c sync Codex  PgUp/PgDn scroll  d return  u units  q quit"
     } else if view.tab == 2 {
-        " d pricing  ↑/↓ model  u units  p period  r refresh  q quit"
+        " c sync Codex  d pricing  ↑/↓ model  u units  p period  r refresh  q quit"
     } else if view.tab == 3 && view.show_event_detail {
-        " ↑/↓ detail  u units  d return  ←/→ page  p period  r refresh  q quit"
+        " c sync Codex  ↑/↓ detail  u units  d return  ←/→ page  p period  r refresh  q quit"
     } else if view.tab == 3 {
-        " 1–6 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  d detail  q quit"
+        " c sync Codex  1–6 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  d detail  q quit"
     } else {
-        " 1–6 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit"
+        " c sync Codex  1–6 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit"
     };
     let footer = if let Some(error) = view.error {
         vec![

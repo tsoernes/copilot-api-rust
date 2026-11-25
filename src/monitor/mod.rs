@@ -1,6 +1,6 @@
 mod catalog;
 mod catalog_ui;
-mod data;
+pub(crate) mod data;
 mod pricing_reference;
 mod ui;
 
@@ -164,6 +164,7 @@ struct App {
     catalog_sort_order: SortOrder,
     catalog_updated: Option<Instant>,
     catalog_error: Option<String>,
+    codex_pending: bool,
     usage_updated: Option<Instant>,
     quota_updated: Option<Instant>,
     usage_error: Option<String>,
@@ -563,6 +564,14 @@ impl App {
                 self.exact_counts = !self.exact_counts;
                 Action::None
             }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                if self.codex_pending {
+                    self.notice = Some("Codex catalogue refresh is already running".into());
+                    Action::None
+                } else {
+                    Action::RefreshCodexCatalog
+                }
+            }
             KeyCode::Char('b') if self.tab == 1 => {
                 self.confirm_billing = true;
                 Action::None
@@ -789,13 +798,14 @@ impl App {
         }
     }
 }
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Action {
     None,
     Quit,
     Usage,
     Both,
     OpenBilling,
+    RefreshCodexCatalog,
 }
 enum Update {
     Usage {
@@ -807,6 +817,7 @@ enum Update {
     },
     Quota(std::result::Result<Value, String>),
     Catalog(std::result::Result<Value, String>),
+    CodexCatalog(std::result::Result<crate::codex_catalog::RefreshSummary, String>),
 }
 
 fn launch_usage(
@@ -857,6 +868,26 @@ fn launch_catalog(client: &MonitorClient, tx: &mpsc::Sender<Update>, tasks: &mut
     tasks.spawn(async move {
         let result = client.fetch_models().await;
         let _ = tx.send(Update::Catalog(result)).await;
+    });
+}
+
+fn launch_codex_catalog_refresh(
+    client: &MonitorClient,
+    endpoint: &str,
+    tx: &mpsc::Sender<Update>,
+    tasks: &mut JoinSet<()>,
+) {
+    let client = client.clone();
+    let endpoint = endpoint.to_owned();
+    let tx = tx.clone();
+    tasks.spawn(async move {
+        let result = match client.fetch_models().await {
+            Ok(models) => crate::codex_catalog::refresh_from_models(&endpoint, models, true)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        let _ = tx.send(Update::CodexCatalog(result)).await;
     });
 }
 
@@ -998,6 +1029,11 @@ pub async fn run(
                         Err(_) => app.notice = Some("Browser unavailable; visit github.com/settings/copilot/features".into()),
                     }
                 }
+                if action == Action::RefreshCodexCatalog {
+                    app.codex_pending = true;
+                    app.notice = Some("refreshing Codex catalog from /models and validating…".into());
+                    launch_codex_catalog_refresh(&client, endpoint, &tx, &mut tasks);
+                }
                 if matches!(action, Action::Usage | Action::Both) {
                     if usage_pending { usage_requeue = true; } else { launch_usage(&client, &app, &tx, &mut tasks); usage_pending = true; }
                 }
@@ -1026,9 +1062,22 @@ pub async fn run(
                     catalog_pending = false; app.apply_catalog(result);
                     if catalog_requeue { catalog_requeue = false; launch_catalog(&client, &tx, &mut tasks); catalog_pending = true; }
                 },
+                Update::CodexCatalog(result) => {
+                    app.codex_pending = false;
+                    app.notice = Some(match result {
+                        Ok(summary) => format!(
+                            "Codex catalog updated: {} models · {} excluded · {}{}",
+                            summary.model_ids.len(),
+                            summary.excluded_count,
+                            if summary.active { "active" } else { "not active" },
+                            if summary.config_updated { " · config updated" } else { "" }
+                        ),
+                        Err(error) => format!("Codex catalog update failed: {error}"),
+                    });
+                },
             },
             Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
-                if joined.is_err() { app.usage_error = Some("Monitoring task failed".into()); usage_pending = false; quota_pending = false; catalog_pending = false; }
+                if joined.is_err() { app.usage_error = Some("Monitoring task failed".into()); usage_pending = false; quota_pending = false; catalog_pending = false; app.codex_pending = false; }
             },
             result = &mut *server => return match result { Ok(Ok(())) => Err(anyhow::anyhow!("server stopped unexpectedly")), Ok(Err(error)) => Err(error).context("server failed"), Err(error) => Err(error).context("server task failed") },
             _ = &mut termination => break,
@@ -1067,6 +1116,21 @@ mod tests {
         assert_eq!(app.page, 2);
         assert!(app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)) == Action::Quit);
         assert!(app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)) == Action::Quit);
+    }
+
+    #[test]
+    fn codex_catalog_key_triggers_refresh_and_ignores_duplicate_clicks() {
+        let mut app = App::default();
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Action::RefreshCodexCatalog
+        );
+        app.codex_pending = true;
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(app.notice.as_deref().unwrap().contains("already running"));
     }
 
     #[test]
@@ -1439,6 +1503,7 @@ mod tests {
                     assert!(result.is_ok());
                     saw_catalog = true;
                 }
+                Update::CodexCatalog(_) => unreachable!("Codex refresh is not launched here"),
             }
         }
         assert!(saw_usage && saw_quota && saw_catalog);

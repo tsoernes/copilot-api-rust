@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use copilot_api_rust::{
     auth::{AuthConfig, CopilotAuth, GitHubAuth},
+    codex_catalog,
     monitor::{self, MemoryLog},
     quota::QuotaClient,
     server,
@@ -26,10 +27,24 @@ struct Cli {
 enum Command {
     /// Authenticate with GitHub using the device flow.
     Auth,
+    /// Refresh Codex's model catalogue from this gateway's available models.
+    UpdateCodexModels(CodexModelsArgs),
     /// Serve the supported Copilot-backed API routes.
     Serve(ServerArgs),
     /// Start the server and its interactive monitoring dashboard together.
     Monitor(ServerArgs),
+}
+
+#[derive(Args)]
+struct CodexModelsArgs {
+    #[arg(long, default_value = "127.0.0.1:4141")]
+    listen: SocketAddr,
+    /// Shared client key, provided via environment to avoid shell history.
+    #[arg(long, env = "COPILOT_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
+    /// Set Codex's top-level model_catalog_json setting to the refreshed catalog.
+    #[arg(long)]
+    activate: bool,
 }
 
 #[derive(Args)]
@@ -68,6 +83,37 @@ async fn main() -> Result<()> {
             let token = github.poll_device_token(&code).await?;
             github.save_github_token(&token)?;
             println!("GitHub token saved.");
+        }
+        Command::UpdateCodexModels(CodexModelsArgs {
+            listen,
+            api_key,
+            activate,
+        }) => {
+            if listen.port() == 0 {
+                bail!("--listen must use a fixed port for the running gateway");
+            }
+            if api_key.as_ref().is_some_and(|key| key.is_empty()) {
+                bail!("API key must not be empty");
+            }
+            let endpoint = local_endpoint(listen);
+            let summary =
+                codex_catalog::refresh_from_endpoint(&endpoint, api_key, activate).await?;
+            println!(
+                "Codex catalogue refreshed: {} models, {} excluded; {}; {}.",
+                summary.model_ids.len(),
+                summary.excluded_count,
+                if summary.active {
+                    "active in Codex config"
+                } else {
+                    "catalogue written but not active"
+                },
+                if summary.config_updated {
+                    "config updated"
+                } else {
+                    "config unchanged"
+                },
+            );
+            println!("Catalog: {}", summary.catalog_path.display());
         }
         Command::Serve(ServerArgs { listen, api_key })
         | Command::Monitor(ServerArgs { listen, api_key }) => {

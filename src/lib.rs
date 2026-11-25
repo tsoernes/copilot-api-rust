@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod auth;
+pub mod codex_catalog;
 mod fusion;
 pub mod monitor;
 pub mod quota;
