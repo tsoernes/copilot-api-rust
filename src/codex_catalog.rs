@@ -20,6 +20,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 const BASE_INSTRUCTIONS: &str = "You are Codex, an AI coding assistant. Help the user complete authorized tasks, use available tools as appropriate, and follow applicable instructions and permission boundaries. Do not claim actions or checks that were not performed.";
+const CATALOG_PROFILE: &str = "copilot-api";
 const CODEX_TIMEOUT: Duration = Duration::from_secs(60);
 const CODEX_OUTPUT_LIMIT: usize = 32 * 1024 * 1024;
 
@@ -62,9 +63,9 @@ pub async fn refresh_from_models(
 
 fn refresh_sync(endpoint: &str, source: Value, activate: bool) -> Result<RefreshSummary> {
     let home = codex_home()?;
-    let profile = profile_name(endpoint)?;
-    let base = home.join("model-catalogs").join(profile);
-    private_dir(&home.join("model-catalogs"))?;
+    let catalogs = home.join("model-catalogs");
+    private_dir(&catalogs)?;
+    let base = catalogs.join(CATALOG_PROFILE);
     private_dir(&base)?;
     let _lock = RefreshLock::acquire(&base)?;
 
@@ -490,19 +491,8 @@ fn codex_home() -> Result<PathBuf> {
         .join(".codex"))
 }
 
-fn profile_name(endpoint: &str) -> Result<String> {
-    let url = reqwest::Url::parse(endpoint).context("invalid local gateway endpoint")?;
-    let port = url
-        .port_or_known_default()
-        .context("local gateway endpoint has no port")?;
-    Ok(format!("localhost-{port}"))
-}
-
 fn run_codex(args: &[&str]) -> Result<Value> {
-    let binary = env::var_os("CODEX_CATALOG_BINARY")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("codex"));
+    let binary = codex_binary();
     let mut command = Command::new(&binary);
     command
         .args(args)
@@ -551,6 +541,27 @@ fn run_codex(args: &[&str]) -> Result<Value> {
         );
     }
     serde_json::from_slice(&stdout).context("Codex CLI returned invalid model JSON")
+}
+
+fn codex_binary() -> PathBuf {
+    if let Some(binary) = env::var_os("CODEX_CATALOG_BINARY").filter(|path| !path.is_empty()) {
+        return PathBuf::from(binary);
+    }
+    if env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|directory| directory.join("codex").is_file())
+    }) {
+        return PathBuf::from("codex");
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".local/bin/codex"))
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            ["/usr/local/bin/codex", "/usr/bin/codex"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from("codex"))
 }
 
 fn read_capped(mut reader: impl Read) -> Result<Vec<u8>> {

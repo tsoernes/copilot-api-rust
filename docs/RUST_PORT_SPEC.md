@@ -32,7 +32,7 @@
 - The available-model catalog should be filterable by model name. (User, 2026-11-21.)
 - The model catalog sorting options should include long-context pricing. (User, 2026-11-21.)
 - Add GitHub Copilot Fusion API support. (User, 2026-11-23.)
-- Add a CLI command and terminal-monitor action to refresh Codex's model catalog from the models served by the local gateway. Preserve exact IDs, include text models even if `/responses` is absent from advertised endpoints, sort GPT models first by descending numeric version, and do not send inference requests. (User request, 2026-11-25; catalog ordering/filter preferences previously clarified 2026-11-06.)
+- Automatically refresh Codex's model catalog on API startup, and provide a CLI command and terminal-monitor action for manual refresh. Build from the models served by the local gateway; preserve exact IDs, include text models even if `/responses` is absent from advertised endpoints, sort GPT models first by descending numeric version, and do not send inference requests. Store the profile under `~/.codex/model-catalogs/copilot-api/`. (User request, 2026-11-25; catalog ordering/filter preferences previously clarified 2026-11-06.)
 - One-time rollout instruction: trigger the Codex catalog refresh after implementation, then restart the API service. (User, 2026-11-25.)
 
 ## Open questions

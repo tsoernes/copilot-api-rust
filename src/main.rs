@@ -166,6 +166,7 @@ async fn main() -> Result<()> {
                         })
                         .await
                 });
+                launch_startup_codex_catalog_refresh(endpoint.clone(), api_key.clone());
                 let result = monitor::run(&endpoint, api_key, &mut server_task, logs, false).await;
                 let _ = shutdown_tx.send(());
                 if !server_task.is_finished() {
@@ -179,6 +180,8 @@ async fn main() -> Result<()> {
                 }
                 return result;
             }
+            let server_endpoint = local_endpoint(listener.local_addr()?);
+            launch_startup_codex_catalog_refresh(server_endpoint, api_key.clone());
             eprintln!("Listening on http://{}", listener.local_addr()?);
             if listener.local_addr()?.ip().is_loopback() {
                 eprintln!(
@@ -266,6 +269,26 @@ async fn run_attached_monitor(
     let result = monitor::run(endpoint, api_key, &mut no_owned_server, logs, true).await;
     no_owned_server.abort();
     result
+}
+
+fn launch_startup_codex_catalog_refresh(endpoint: String, api_key: Option<String>) {
+    tokio::spawn(async move {
+        // Let Axum enter its accept loop before making the local models request.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        match codex_catalog::refresh_from_endpoint(&endpoint, api_key, true).await {
+            Ok(summary) => tracing::info!(
+                models = summary.model_ids.len(),
+                excluded = summary.excluded_count,
+                active = summary.active,
+                config_updated = summary.config_updated,
+                "Updated Codex model catalog at API startup"
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "Could not refresh Codex model catalog at API startup; gateway will continue"
+            ),
+        }
+    });
 }
 
 #[cfg(test)]
