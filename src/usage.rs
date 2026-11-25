@@ -66,6 +66,8 @@ pub struct UsageEvent {
     /// Optional provider-reported nested token counters, keyed by wire path.
     /// These may overlap aggregate counters and must not be added to totals.
     pub token_details: Option<BTreeMap<String, i64>>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
 }
 
 pub struct UsageStore {
@@ -225,7 +227,7 @@ impl UsageStore {
                 cache_read_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL, total_nano_aiu INTEGER,
                 duration_ms INTEGER, first_token_ms INTEGER, request_outcome TEXT,
-                token_details TEXT
+                token_details TEXT, error_code TEXT, error_message TEXT
             );
             CREATE INDEX rust_usage_time ON rust_usage_events(created_at_ms, id);
             CREATE INDEX rust_usage_request ON rust_usage_events(request_id);
@@ -264,6 +266,30 @@ impl UsageStore {
                     && not_null == 0
                     && primary_key == 0 => {}
             Some(_) => bail!("usage database token_details column has an unsupported schema"),
+        }
+        for (column, length) in [("error_code", 64i64), ("error_message", 1024i64)] {
+            let existing = tx
+                .prepare("PRAGMA table_info(rust_usage_events)")?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            match existing.iter().find(|(name, _, _, _)| name == column) {
+                None => tx.execute_batch(&format!(
+                    "ALTER TABLE rust_usage_events ADD COLUMN {column} TEXT"
+                ))?,
+                Some((_, column_type, not_null, primary_key))
+                    if column_type.eq_ignore_ascii_case("TEXT")
+                        && *not_null == 0
+                        && *primary_key == 0 => {}
+                Some(_) => bail!("usage database {column} column has an unsupported schema"),
+            }
+            let _ = length;
         }
         // Quota snapshots are a separate additive table. Keeping the original
         // app ID and schema version lets older Rust binaries continue to use
@@ -508,8 +534,16 @@ impl UsageStore {
         }
         event.user_agent = event.user_agent.chars().take(64).collect();
         let db = self.lock()?;
-        db.execute("INSERT INTO rust_usage_events (created_at_ms,trace_id,session_id,request_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens,total_nano_aiu,duration_ms,first_token_ms,request_outcome,token_details) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![event.created_at_ms,event.trace_id,event.session_id,event.request_id,event.user_agent,event.endpoint,event.model,event.input_tokens,event.output_tokens,event.cache_read_input_tokens,event.cache_creation_input_tokens,event.total_tokens,event.total_nano_aiu,event.duration_ms,event.first_token_ms,event.request_outcome,details])?;
+        let error_code = event
+            .error_code
+            .as_deref()
+            .map(|value| value.chars().take(64).collect::<String>());
+        let error_message = event
+            .error_message
+            .as_deref()
+            .map(|value| value.chars().take(1024).collect::<String>());
+        db.execute("INSERT INTO rust_usage_events (created_at_ms,trace_id,session_id,request_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens,total_nano_aiu,duration_ms,first_token_ms,request_outcome,token_details,error_code,error_message) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![event.created_at_ms,event.trace_id,event.session_id,event.request_id,event.user_agent,event.endpoint,event.model,event.input_tokens,event.output_tokens,event.cache_read_input_tokens,event.cache_creation_input_tokens,event.total_tokens,event.total_nano_aiu,event.duration_ms,event.first_token_ms,event.request_outcome,details,error_code,error_message])?;
         Ok(())
     }
 
@@ -604,7 +638,7 @@ impl UsageStore {
             params![start, end],
             |r| r.get(0),
         )?;
-        let mut stmt = db.prepare("SELECT id,created_at_ms,trace_id,session_id,request_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens,total_nano_aiu,duration_ms,first_token_ms,request_outcome,(SELECT count(*) FROM rust_usage_events AS siblings WHERE siblings.request_id=rust_usage_events.request_id),CASE WHEN typeof(token_details)='text' AND length(token_details)<=8192 THEN token_details ELSE NULL END FROM rust_usage_events WHERE created_at_ms>=? AND created_at_ms<? ORDER BY created_at_ms DESC,id DESC LIMIT ? OFFSET ?")?;
+        let mut stmt = db.prepare("SELECT id,created_at_ms,trace_id,session_id,request_id,user_agent,endpoint,model,input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens,total_tokens,total_nano_aiu,duration_ms,first_token_ms,request_outcome,(SELECT count(*) FROM rust_usage_events AS siblings WHERE siblings.request_id=rust_usage_events.request_id),CASE WHEN typeof(token_details)='text' AND length(token_details)<=8192 THEN token_details ELSE NULL END,CASE WHEN typeof(error_code)='text' AND length(error_code)<=64 THEN error_code ELSE NULL END,CASE WHEN typeof(error_message)='text' AND length(error_message)<=1024 THEN error_message ELSE NULL END FROM rust_usage_events WHERE created_at_ms>=? AND created_at_ms<? ORDER BY created_at_ms DESC,id DESC LIMIT ? OFFSET ?")?;
         let rows = stmt.query_map(params![start,end,size,offset], |r| {
             let created_at_ms: i64=r.get(1)?;
             let output: i64=r.get(9)?;
@@ -621,7 +655,7 @@ impl UsageStore {
             let speed=if outcome.as_deref()==Some("completed") && siblings==1 && output>0 {
                 duration.zip(first).and_then(|(d,f)| if d>f {Some(output as f64*1000.0/(d-f) as f64)} else {None})
             } else {None};
-            Ok(json!({"id":r.get::<_,i64>(0)?,"created_at_ms":created_at_ms,"created_at_utc":iso(created_at_ms).ok(),"trace_id":r.get::<_,String>(2)?,"session_id":r.get::<_,String>(3)?,"request_id":r.get::<_,Option<String>>(4)?,"user_agent":r.get::<_,String>(5)?,"endpoint":r.get::<_,String>(6)?,"model":r.get::<_,String>(7)?,"input_tokens":r.get::<_,i64>(8)?,"output_tokens":output,"cache_read_input_tokens":r.get::<_,i64>(10)?,"cache_creation_input_tokens":r.get::<_,i64>(11)?,"total_tokens":r.get::<_,i64>(12)?,"total_nano_aiu":aiu,"duration_ms":duration,"first_token_ms":first,"request_outcome":outcome,"output_tokens_per_second":speed,"api_key_id":null,"api_key_name":null,"source":"copilot","provider_name":null,"user_id":"","cost":cost,"token_details":token_details}))
+            Ok(json!({"id":r.get::<_,i64>(0)?,"created_at_ms":created_at_ms,"created_at_utc":iso(created_at_ms).ok(),"trace_id":r.get::<_,String>(2)?,"session_id":r.get::<_,String>(3)?,"request_id":r.get::<_,Option<String>>(4)?,"user_agent":r.get::<_,String>(5)?,"endpoint":r.get::<_,String>(6)?,"model":r.get::<_,String>(7)?,"input_tokens":r.get::<_,i64>(8)?,"output_tokens":output,"cache_read_input_tokens":r.get::<_,i64>(10)?,"cache_creation_input_tokens":r.get::<_,i64>(11)?,"total_tokens":r.get::<_,i64>(12)?,"total_nano_aiu":aiu,"duration_ms":duration,"first_token_ms":first,"request_outcome":outcome,"output_tokens_per_second":speed,"api_key_id":null,"api_key_name":null,"source":"copilot","provider_name":null,"user_id":"","cost":cost,"token_details":token_details,"error_code":r.get::<_,Option<String>>(19)?,"error_message":r.get::<_,Option<String>>(20)?}))
         })?;
         let items: Vec<Value> = rows.collect::<rusqlite::Result<_>>()?;
         page_json(items, page, size, total, period, start, end)
@@ -1202,6 +1236,23 @@ mod tests {
                 Value::Null
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn request_errors_roundtrip_through_bounded_storage() -> Result<()> {
+        let store = UsageStore::in_memory()?;
+        let mut sample = event("model", "session", 1);
+        sample.request_outcome = Some("error".into());
+        sample.error_code = Some("invalid_request_body".into());
+        sample.error_message = Some("Missing required field: encrypted_content".into());
+        store.record(sample)?;
+        let item = &store.events("lifetime", 1, 20)?["items"][0];
+        assert_eq!(item["error_code"], "invalid_request_body");
+        assert_eq!(
+            item["error_message"],
+            "Missing required field: encrypted_content"
+        );
         Ok(())
     }
 

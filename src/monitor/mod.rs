@@ -142,6 +142,7 @@ struct App {
     session_page: usize,
     session_offset: usize,
     show_event_detail: bool,
+    show_event_error: bool,
     detail_scroll: usize,
     selected_event_id: Option<i64>,
     confirm_billing: bool,
@@ -394,6 +395,59 @@ impl App {
         }
     }
     fn key_in_terminal(&mut self, key: KeyEvent, width: u16, height: u16) -> Action {
+        if self.tab == 3
+            && self.show_event_error
+            && key.kind != KeyEventKind::Release
+            && matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j')
+            )
+        {
+            self.detail_scroll = match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.detail_scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => self.detail_scroll.saturating_add(1),
+                _ => self.detail_scroll,
+            };
+            if let Some(event) = self
+                .events
+                .as_ref()
+                .and_then(|v| v.get("items"))
+                .and_then(Value::as_array)
+                .and_then(|events| events.get(self.event_offset))
+            {
+                self.detail_scroll = self.detail_scroll.min(
+                    ui::event_error_lines(event, width.saturating_sub(6))
+                        .len()
+                        .saturating_sub(1),
+                );
+            }
+            return Action::None;
+        }
+        if self.tab == 3 && key.code == KeyCode::Enter && key.kind != KeyEventKind::Release {
+            if self.show_event_error {
+                self.show_event_error = false;
+                self.detail_scroll = 0;
+                return Action::None;
+            }
+            if self.show_event_detail {
+                self.show_event_detail = false;
+                self.selected_event_id = None;
+                return Action::None;
+            }
+            if let Some(event) = self
+                .events
+                .as_ref()
+                .and_then(|v| v.get("items"))
+                .and_then(Value::as_array)
+                .and_then(|events| events.get(self.event_offset))
+                && event.get("request_outcome").and_then(Value::as_str) == Some("error")
+                && ui::event_error_lines(event, width.saturating_sub(6)).len() > 2
+            {
+                self.show_event_error = true;
+                self.detail_scroll = 0;
+                return Action::None;
+            }
+        }
         // Never allow an unseen billing confirmation to open a browser.
         if width < 42 || height < 10 {
             if self.confirm_billing {
@@ -434,6 +488,28 @@ impl App {
                         )
                     })
                     .unwrap_or(0)
+            } else if self.tab == 3 && self.show_event_error {
+                if let Some(event) = self
+                    .events
+                    .as_ref()
+                    .and_then(|v| v.get("items"))
+                    .and_then(Value::as_array)
+                    .and_then(|events| events.get(self.event_offset))
+                {
+                    let maximum = ui::event_error_lines(event, width.saturating_sub(6))
+                        .len()
+                        .saturating_sub(1);
+                    self.detail_scroll = match key.code {
+                        KeyCode::PageUp => self.detail_scroll.saturating_sub(usize::from(step)),
+                        KeyCode::PageDown => self
+                            .detail_scroll
+                            .saturating_add(usize::from(step))
+                            .min(maximum),
+                        _ => self.detail_scroll,
+                    };
+                    return Action::None;
+                }
+                0
             } else {
                 0
             };
@@ -513,7 +589,7 @@ impl App {
             return Action::None;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Char('q') | KeyCode::Esc if !self.show_event_error => Action::Quit,
             KeyCode::Char('1') => {
                 self.tab = 0;
                 Action::None
@@ -554,6 +630,7 @@ impl App {
                 self.session_page = 1;
                 self.session_offset = 0;
                 self.show_event_detail = false;
+                self.show_event_error = false;
                 self.detail_scroll = 0;
                 self.selected_event_id = None;
                 self.clear_usage();
@@ -576,7 +653,13 @@ impl App {
                 self.confirm_billing = true;
                 Action::None
             }
+            KeyCode::Esc if self.show_event_error => {
+                self.show_event_error = false;
+                self.detail_scroll = 0;
+                Action::None
+            }
             KeyCode::Char('d') if self.tab == 3 => {
+                self.show_event_error = false;
                 if self.show_event_detail {
                     self.show_event_detail = false;
                     self.selected_event_id = None;
@@ -746,6 +829,7 @@ impl App {
                 self.page -= 1;
                 self.event_offset = 0;
                 self.show_event_detail = false;
+                self.show_event_error = false;
                 self.detail_scroll = 0;
                 self.selected_event_id = None;
                 self.events = None;
@@ -762,6 +846,7 @@ impl App {
                     self.page += 1;
                     self.event_offset = 0;
                     self.show_event_detail = false;
+                    self.show_event_error = false;
                     self.detail_scroll = 0;
                     self.selected_event_id = None;
                     self.events = None;
@@ -1006,6 +1091,7 @@ pub async fn run(
                     session_page: app.session_page,
                     session_offset: app.session_offset,
                     show_event_detail: app.show_event_detail,
+                    show_event_error: app.show_event_error,
                     detail_scroll: app.detail_scroll,
                     confirm_billing: app.confirm_billing,
                     exact_counts: app.exact_counts,
@@ -1308,6 +1394,29 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert!(!app.show_event_detail);
         assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn enter_opens_popup_only_for_long_request_errors() {
+        let short = serde_json::json!({"items":[{"id":1,"request_outcome":"error","error_code":"invalid_request_body","error_message":"short"}]});
+        let mut app = App {
+            tab: 3,
+            events: Some(short),
+            ..App::default()
+        };
+        app.key_in_terminal(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 120, 30);
+        assert!(!app.show_event_error);
+
+        app.events = Some(serde_json::json!({"items":[{
+            "id":1,
+            "request_outcome":"error",
+            "error_code":"invalid_request_body",
+            "error_message":"very long provider message ".repeat(20)
+        }]}));
+        app.key_in_terminal(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 80, 30);
+        assert!(app.show_event_error);
+        app.key_in_terminal(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 80, 30);
+        assert!(!app.show_event_error);
     }
 
     #[test]

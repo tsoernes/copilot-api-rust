@@ -99,6 +99,8 @@ impl UsageStream {
                 event.token_details = Some(observed.token_details);
             }
             event.first_token_ms = observed.first_token_ms;
+            event.error_code = observed.provider_error_code;
+            event.error_message = observed.provider_error_message;
         }
         event.duration_ms =
             Some(i64::try_from(self.start.elapsed().as_millis()).unwrap_or(i64::MAX));

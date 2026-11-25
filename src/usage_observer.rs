@@ -18,6 +18,7 @@ pub struct ObservedUsage {
     pub first_token_ms: Option<i64>,
     pub protocol_error: bool,
     pub provider_error_code: Option<String>,
+    pub provider_error_message: Option<String>,
     pub terminal: Option<StreamTerminal>,
     pub monthly_quota_exceeded: bool,
     /// Optional provider-reported nested token subcounts; may overlap totals.
@@ -268,6 +269,8 @@ impl UsageObserver {
                 .or_else(|| value.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            self.usage.provider_error_message =
+                (!message.is_empty()).then(|| safe_error_message(message));
             if message
                 .to_ascii_lowercase()
                 .contains("you have exceeded your monthly quota")
@@ -434,6 +437,17 @@ fn safe_error_code(code: &str) -> String {
         .collect()
 }
 
+fn safe_error_message(message: &str) -> String {
+    message
+        .chars()
+        .filter(|ch| !ch.is_control() || ch.is_whitespace())
+        .take(1024)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn assign(target: &mut Option<i64>, value: Option<i64>) {
     if value.is_some() {
         *target = value;
@@ -575,10 +589,18 @@ mod tests {
             result.provider_error_code.as_deref(),
             Some("invalid_request_body")
         );
+        assert_eq!(
+            result.provider_error_message.as_deref(),
+            Some("sensitive detail")
+        );
 
         let unsafe_code = format!("safe_code_{}!secret", "x".repeat(80));
         assert_eq!(safe_error_code(&unsafe_code).len(), 64);
         assert!(!safe_error_code(&unsafe_code).contains('!'));
+        assert_eq!(
+            safe_error_message("  safe\nmessage\u{1b}[31m  "),
+            "safe message[31m"
+        );
     }
 
     #[test]

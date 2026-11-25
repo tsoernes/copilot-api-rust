@@ -41,6 +41,7 @@ pub struct View<'a> {
     pub session_page: usize,
     pub session_offset: usize,
     pub show_event_detail: bool,
+    pub show_event_error: bool,
     pub detail_scroll: usize,
     pub confirm_billing: bool,
     pub exact_counts: bool,
@@ -472,8 +473,10 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
         " c sync Codex  d pricing  ↑/↓ model  u units  p period  r refresh  q quit"
     } else if view.tab == 3 && view.show_event_detail {
         " c sync Codex  ↑/↓ detail  u units  d return  ←/→ page  p period  r refresh  q quit"
+    } else if view.tab == 3 && view.show_event_error {
+        " c sync Codex  ↑/↓ PgUp/PgDn scroll  Enter/Esc close  q quit"
     } else if view.tab == 3 {
-        " c sync Codex  1–6 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  d detail  q quit"
+        " c sync Codex  1–6 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  Enter error  ←/→ page  d detail  q quit"
     } else {
         " c sync Codex  1–6 Tab  u units  p period  r refresh  space pause  ↑/↓ scroll  ←/→ page  q quit"
     };
@@ -509,6 +512,35 @@ pub fn render(frame: &mut Frame<'_>, view: &View<'_>) {
             Paragraph::new("Open GitHub Copilot billing settings?\ny open / n cancel\nSelection changes are made by you in GitHub; this gateway does not switch automatically.\nhttps://github.com/settings/copilot/features")
                 .block(panel("Confirm browser action"))
                 .wrap(Wrap { trim: false }),
+            popup,
+        );
+    }
+    if view.show_event_error
+        && let Some(event) = view
+            .events
+            .and_then(|events| events.get("items"))
+            .and_then(Value::as_array)
+            .and_then(|events| events.get(view.event_offset))
+    {
+        let width = area
+            .width
+            .saturating_sub(6)
+            .clamp(24.min(area.width), area.width);
+        let lines = event_error_lines(event, width.saturating_sub(2));
+        let height = lines.len().saturating_add(2).clamp(5, 18);
+        let popup = Rect::new(
+            area.x + (area.width.saturating_sub(width)) / 2,
+            area.y + (area.height.saturating_sub(height as u16)) / 2,
+            width,
+            height as u16,
+        );
+        let maximum = lines.len().saturating_sub(1);
+        let scroll = u16::try_from(view.detail_scroll.min(maximum)).unwrap_or(u16::MAX);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                .block(panel("Request error · Enter/Esc close"))
+                .scroll((scroll, 0)),
             popup,
         );
     }
@@ -1369,8 +1401,39 @@ fn models(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
 /// Build physical lines once for consistent rendering and scroll bounds. The
 /// detail object is deliberately never summed: provider fields may overlap.
 fn event_detail_lines(event: &Value, exact: bool) -> Vec<String> {
+    let outcome = text(event, "request_outcome");
     let mut lines = vec![
+        format!("Outcome: {outcome}"),
         format!("Model: {}", text(event, "model")),
+        format!("Endpoint: {}", text(event, "endpoint")),
+        format!("Request ID: {}", text(event, "request_id")),
+        "".into(),
+    ];
+    if outcome == "error" {
+        lines.push("Error:".into());
+        lines.push(format!(
+            "  Code: {}",
+            event
+                .get("error_code")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(clean)
+                .unwrap_or_else(|| "not reported".into())
+        ));
+        let error = event
+            .get("error_message")
+            .and_then(Value::as_str)
+            .map(clean)
+            .filter(|value| !value.is_empty());
+        if let Some(error) = error {
+            let wrapped = wrap_physical_lines(vec![format!("  Message: {error}")], 38);
+            lines.extend(wrapped);
+        } else {
+            lines.push("  Message: not reported (including older rows).".into());
+        }
+        lines.push("".into());
+    }
+    lines.extend([
         format!("Input: {}", count(event.get("input_tokens"), exact)),
         format!("Output: {}", count(event.get("output_tokens"), exact)),
         format!(
@@ -1385,7 +1448,7 @@ fn event_detail_lines(event: &Value, exact: bool) -> Vec<String> {
         "".into(),
         "Provider-reported subcounts:".into(),
         "Overlapping; do not sum.".into(),
-    ];
+    ]);
     let mut details: Vec<_> = event
         .get("token_details")
         .and_then(Value::as_object)
@@ -1419,6 +1482,25 @@ fn event_detail_lines(event: &Value, exact: bool) -> Vec<String> {
         }
     }
     lines
+}
+
+pub(crate) fn event_error_lines(event: &Value, width: u16) -> Vec<String> {
+    let code = event
+        .get("error_code")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(clean)
+        .unwrap_or_else(|| "not reported".into());
+    let message = event
+        .get("error_message")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(clean)
+        .unwrap_or_else(|| "not reported (including older rows)".into());
+    wrap_physical_lines(
+        vec![format!("Code: {code}"), format!("Message: {message}")],
+        usize::from(width.max(20)),
+    )
 }
 
 /// Number of rendered detail lines for clamping keyboard scrolling.
@@ -1733,6 +1815,12 @@ fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
                 count(event.get(*key), view.exact_counts)
             ))
         }));
+        if text(event, "request_outcome") == "error" {
+            let error_lines = event_error_lines(event, area.width.saturating_sub(4));
+            if error_lines.len() <= 2 {
+                lines.extend(error_lines.into_iter().map(Line::from));
+            }
+        }
         frame.render_widget(Paragraph::new(lines).block(panel(&title)), area);
         return;
     }
@@ -1808,7 +1896,23 @@ fn events(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     )
     .column_spacing(1)
     .block(panel(&title));
-    frame.render_widget(table, area);
+    let error_lines = (text(&rows[offset], "request_outcome") == "error")
+        .then(|| event_error_lines(&rows[offset], area.width.saturating_sub(4)));
+    if let Some(lines) = error_lines.filter(|lines| lines.len() <= 2) {
+        let layout = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(2 + u16::try_from(lines.len()).unwrap_or(u16::MAX)),
+        ])
+        .split(area);
+        frame.render_widget(table, layout[0]);
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                .block(panel("Request error")),
+            layout[1],
+        );
+    } else {
+        frame.render_widget(table, area);
+    }
 }
 
 #[cfg(test)]
@@ -1852,6 +1956,7 @@ mod tests {
             session_page: 1,
             session_offset: 0,
             show_event_detail: false,
+            show_event_error: false,
             detail_scroll: 0,
             confirm_billing: false,
             exact_counts: true,
@@ -2227,7 +2332,29 @@ mod tests {
         v.detail_scroll = usize::MAX;
         terminal.draw(|f| render(f, &v)).unwrap();
         assert!(render_text(&terminal).contains("Not reported (including older rows)"));
-        assert_eq!(event_detail_line_count(&historic), 10);
+        assert_eq!(event_detail_line_count(&historic), 14);
+    }
+
+    #[test]
+    fn short_request_errors_are_visible_and_long_errors_are_popup_lines() {
+        let short = json!({
+            "request_outcome":"error",
+            "error_code":"invalid_request_body",
+            "error_message":"Missing required field."
+        });
+        assert_eq!(event_error_lines(&short, 100).len(), 2);
+
+        let long = json!({
+            "request_outcome":"error",
+            "error_code":"invalid_request_body",
+            "error_message":format!("{} details", "very-long-error ".repeat(20))
+        });
+        assert!(event_error_lines(&long, 30).len() > 2);
+        assert!(
+            event_error_lines(&long, 30)
+                .iter()
+                .all(|line| line.chars().count() <= 30)
+        );
     }
 
     #[test]
