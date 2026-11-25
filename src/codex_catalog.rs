@@ -262,16 +262,28 @@ fn build_catalog(source: &Value, bundled: &Value) -> Result<BuiltCatalog> {
         compare_model_ids(left_id, right_id)
     });
 
+    let mut display_name_counts = std::collections::HashMap::new();
+    for record in &included {
+        let label = model_display_name(record);
+        *display_name_counts
+            .entry(normalize_display_name(label))
+            .or_insert(0usize) += 1;
+    }
+
     let mut model_ids = Vec::with_capacity(included.len());
     let mut models = Vec::with_capacity(included.len());
     for (priority, record) in included.into_iter().enumerate() {
         let id = record["id"].as_str().unwrap_or_default();
         let name = record.get("name").and_then(Value::as_str).unwrap_or(id);
-        let display_name = record
-            .get("display_name")
-            .and_then(Value::as_str)
-            .or_else(|| record.get("name").and_then(Value::as_str))
-            .unwrap_or(id);
+        let display_name = model_display_name(record);
+        let display_name = if display_name_counts
+            .get(&normalize_display_name(display_name))
+            .is_some_and(|count| *count > 1)
+        {
+            format!("{display_name} ({id})")
+        } else {
+            display_name.to_owned()
+        };
         let supports = record.pointer("/capabilities/supports");
         let efforts = string_array(supports.and_then(|value| value.get("reasoning_effort")))
             .context("invalid reasoning-effort metadata in model catalog")?;
@@ -373,6 +385,28 @@ fn build_catalog(source: &Value, bundled: &Value) -> Result<BuiltCatalog> {
         excluded,
         source_count: records.len(),
     })
+}
+
+fn model_display_name(record: &Value) -> &str {
+    record
+        .get("display_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            record
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+        })
+        .or_else(|| record.get("id").and_then(Value::as_str))
+        .unwrap_or("unknown model")
+}
+
+fn normalize_display_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn string_array(value: Option<&Value>) -> Result<Vec<String>> {
@@ -890,6 +924,34 @@ mod tests {
         assert_eq!(entry["default_reasoning_level"], "high");
         assert_eq!(entry["context_window"], 128000);
         assert_eq!(entry["auto_compact_token_limit"], 115200);
+    }
+
+    #[test]
+    fn duplicate_display_names_are_disambiguated_with_exact_gateway_ids() {
+        let source = source(vec![
+            json!({"id":"gpt-4o-2024-11-20","name":"GPT-4o"}),
+            json!({"id":"gpt-4o","name":"GPT-4o"}),
+            json!({"id":"claude-sonnet-5.5","name":"Claude Sonnet 5.5"}),
+        ]);
+        let built = build_catalog(&source, &json!({"models": []})).unwrap();
+        let models = built.catalog["models"].as_array().unwrap();
+        let gpt4o: Vec<_> = models
+            .iter()
+            .filter(|model| {
+                model["display_name"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("GPT-4o")
+            })
+            .map(|model| model["display_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(gpt4o, ["GPT-4o (gpt-4o-2024-11-20)", "GPT-4o (gpt-4o)"]);
+        assert!(
+            models
+                .iter()
+                .any(|model| { model["display_name"] == "Claude Sonnet 5.5" })
+        );
+        assert_eq!(built.model_ids.len(), 3);
     }
 
     #[test]
