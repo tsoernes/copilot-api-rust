@@ -54,6 +54,9 @@ struct ServerArgs {
     /// Shared client key, provided via environment to avoid shell history.
     #[arg(long, env = "COPILOT_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
+    /// Accept Codex Responses WebSockets and relay them upstream to GitHub.
+    #[arg(long, env = "COPILOT_API_RESPONSES_WEBSOCKETS")]
+    responses_websockets: bool,
 }
 
 #[tokio::main]
@@ -115,8 +118,16 @@ async fn main() -> Result<()> {
             );
             println!("Catalog: {}", summary.catalog_path.display());
         }
-        Command::Serve(ServerArgs { listen, api_key })
-        | Command::Monitor(ServerArgs { listen, api_key }) => {
+        Command::Serve(ServerArgs {
+            listen,
+            api_key,
+            responses_websockets,
+        })
+        | Command::Monitor(ServerArgs {
+            listen,
+            api_key,
+            responses_websockets,
+        }) => {
             if monitoring && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
                 bail!("monitor requires an interactive terminal on stdin and stdout");
             }
@@ -141,7 +152,13 @@ async fn main() -> Result<()> {
             let db_path = usage_db_path()?;
             let usage =
                 Arc::new(UsageStore::open(&db_path).context("opening Rust usage database")?);
-            let app = server::router(auth, api_key.clone(), quota, usage)?;
+            let app = server::router_with_websockets(
+                auth,
+                api_key.clone(),
+                quota,
+                usage,
+                responses_websockets,
+            )?;
             let listener = match tokio::net::TcpListener::bind(listen).await {
                 Ok(listener) => listener,
                 Err(error) if monitoring && error.kind() == std::io::ErrorKind::AddrInUse => {

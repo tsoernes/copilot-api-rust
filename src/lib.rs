@@ -4,6 +4,7 @@ pub mod codex_catalog;
 mod fusion;
 pub mod monitor;
 pub mod quota;
+mod responses_websocket;
 pub mod server;
 mod session_id;
 pub mod usage;

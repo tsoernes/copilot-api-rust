@@ -38,7 +38,8 @@ pub(crate) struct AppState {
     pub(crate) api_key: Option<String>,
     device_id: String,
     quota: Option<Arc<QuotaClient>>,
-    usage: Option<Arc<UsageStore>>,
+    pub(crate) usage: Option<Arc<UsageStore>>,
+    pub(crate) responses_websockets: bool,
     #[cfg(test)]
     pub(crate) test_credential: Option<crate::auth::CopilotCredential>,
 }
@@ -49,9 +50,20 @@ pub fn router(
     quota: Arc<QuotaClient>,
     usage: Arc<UsageStore>,
 ) -> Result<Router> {
+    router_with_websockets(auth, api_key, quota, usage, false)
+}
+
+pub fn router_with_websockets(
+    auth: Arc<CopilotAuth>,
+    api_key: Option<String>,
+    quota: Arc<QuotaClient>,
+    usage: Arc<UsageStore>,
+    responses_websockets: bool,
+) -> Result<Router> {
     let mut state = new_state(auth, api_key)?;
     state.quota = Some(quota);
     state.usage = Some(usage);
+    state.responses_websockets = responses_websockets;
     Ok(build_router(state))
 }
 
@@ -67,6 +79,7 @@ fn new_state(auth: Arc<CopilotAuth>, api_key: Option<String>) -> Result<AppState
         device_id: Uuid::new_v4().to_string(),
         quota: None,
         usage: None,
+        responses_websockets: false,
         #[cfg(test)]
         test_credential: None,
     })
@@ -102,6 +115,24 @@ pub(crate) fn router_with_test_usage(
     Ok(build_router(state))
 }
 
+#[cfg(test)]
+pub(crate) fn router_with_test_websockets(
+    api_base: String,
+    api_key: Option<String>,
+    usage: Arc<UsageStore>,
+) -> Result<Router> {
+    let github = crate::auth::GitHubAuth::new(crate::auth::AuthConfig::default())?;
+    let auth = Arc::new(CopilotAuth::new(github, "test-github-token".into())?);
+    let mut state = new_state(auth, api_key)?;
+    state.test_credential = Some(crate::auth::CopilotCredential {
+        api_base,
+        token: "test-copilot-token".into(),
+    });
+    state.usage = Some(usage);
+    state.responses_websockets = true;
+    Ok(build_router(state))
+}
+
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(|| async { "copilot-api-rust (partial port)" }))
@@ -121,8 +152,14 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(proxy))
         .route("/embeddings", post(proxy))
         .route("/v1/embeddings", post(proxy))
-        .route("/responses", post(proxy))
-        .route("/v1/responses", post(proxy))
+        .route(
+            "/responses",
+            get(crate::responses_websocket::upgrade).post(proxy),
+        )
+        .route(
+            "/v1/responses",
+            get(crate::responses_websocket::upgrade).post(proxy),
+        )
         .route("/v1/messages", post(proxy))
         .merge(crate::fusion::router())
         .layer(middleware::from_fn_with_state(
@@ -150,6 +187,81 @@ impl AppState {
         }
         self.auth.credential().await
     }
+}
+
+pub(crate) fn build_upstream_headers(
+    state: &AppState,
+    token: &str,
+    request_id: &str,
+    client_headers: &HeaderMap,
+    vision: bool,
+    websocket: bool,
+    initiator: &str,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let bearer = HeaderValue::from_str(&format!("Bearer {token}"))
+        .expect("Copilot token is validated before caching");
+    headers.insert(header::AUTHORIZATION, bearer);
+    headers.insert(
+        "copilot-integration-id",
+        HeaderValue::from_static("vscode-chat"),
+    );
+    headers.insert(
+        "editor-device-id",
+        HeaderValue::from_str(&state.device_id).expect("UUID"),
+    );
+    headers.insert("editor-version", HeaderValue::from_static("vscode/1.106.0"));
+    headers.insert(
+        "editor-plugin-version",
+        HeaderValue::from_static("copilot-chat/0.72.0"),
+    );
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static("GitHubCopilotChat/0.72.0"),
+    );
+    headers.insert(
+        "x-github-api-version",
+        HeaderValue::from_static("2026-08-01"),
+    );
+    headers.insert(
+        "x-request-id",
+        HeaderValue::from_str(request_id).expect("UUID"),
+    );
+    headers.insert(
+        "x-agent-task-id",
+        HeaderValue::from_str(request_id).expect("UUID"),
+    );
+    headers.insert(
+        "x-interaction-type",
+        HeaderValue::from_static("conversation-agent"),
+    );
+    headers.insert(
+        "openai-intent",
+        HeaderValue::from_static("conversation-agent"),
+    );
+    headers.insert(
+        "x-initiator",
+        HeaderValue::from_str(initiator).expect("known initiator"),
+    );
+    if websocket {
+        headers.insert(
+            "x-vscode-user-agent-library-version",
+            HeaderValue::from_static("electron-fetch"),
+        );
+    }
+    if vision {
+        headers.insert("copilot-vision-request", HeaderValue::from_static("true"));
+    }
+    for name in [
+        HeaderName::from_static("traceparent"),
+        HeaderName::from_static("x-codex-thread-id"),
+        HeaderName::from_static("x-codex-turn-id"),
+    ] {
+        if let Some(value) = client_headers.get(&name) {
+            headers.insert(name, value.clone());
+        }
+    }
+    headers
 }
 
 // This gateway has no browser UI. Reject browser Origins even with an API key,
@@ -498,13 +610,13 @@ fn contains_image(v: &Value) -> bool {
     }
 }
 
-struct PreparedPayload {
-    body: Bytes,
-    vision: bool,
-    initiator: &'static str,
-    model: String,
-    anthropic_beta: Option<String>,
-    stripped_opaque_reasoning: usize,
+pub(crate) struct PreparedPayload {
+    pub(crate) body: Bytes,
+    pub(crate) vision: bool,
+    pub(crate) initiator: &'static str,
+    pub(crate) model: String,
+    pub(crate) anthropic_beta: Option<String>,
+    pub(crate) stripped_opaque_reasoning: usize,
 }
 
 impl PreparedPayload {
@@ -646,7 +758,11 @@ fn strip_opaque_responses_state(value: &mut Value) -> usize {
     removed
 }
 
-fn prepare_payload(path: &str, body: Bytes, headers: &HeaderMap) -> Result<PreparedPayload, ()> {
+pub(crate) fn prepare_payload(
+    path: &str,
+    body: Bytes,
+    headers: &HeaderMap,
+) -> Result<PreparedPayload, ()> {
     let parsed = serde_json::from_slice::<Value>(&body).map_err(|_| ());
     // The parsed Value owns its strings. Drop our reference to the original
     // input before allocating the canonical serialized body; other Bytes
@@ -834,6 +950,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         .header("x-interaction-type", interaction)
         .header("openai-intent", interaction)
         .header("x-initiator", initiator);
+    // Kept below as the shared wire shape used by HTTP and WebSocket.
     if vision {
         upstream = upstream.header("copilot-vision-request", "true");
     }
