@@ -3,7 +3,7 @@ use super::{
     catalog::{CatalogModel, SortKey},
     catalog_ui,
 };
-use chrono::{Local, TimeZone};
+use chrono::{Local, TimeZone, Utc};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -683,6 +683,187 @@ fn quota_runout_basis(window: &Value, estimate: &str) -> Option<String> {
     }
 }
 
+struct QuotaRefreshForecast {
+    detail: String,
+    compact: String,
+    bar_label: String,
+}
+
+fn quota_refresh_forecast(
+    window: &Value,
+    estimate: &str,
+    now_seconds: i64,
+) -> QuotaRefreshForecast {
+    let unlimited = window
+        .get("unlimited")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || estimate == "unlimited";
+    if unlimited {
+        return QuotaRefreshForecast {
+            detail: "Unlimited quota; it will not run out before refresh.".into(),
+            compact: "unlimited".into(),
+            bar_label: "unlimited".into(),
+        };
+    }
+    if estimate == "already depleted" {
+        return QuotaRefreshForecast {
+            detail: "Quota is already depleted.".into(),
+            compact: "already depleted".into(),
+            bar_label: "depleted".into(),
+        };
+    }
+
+    let reset_at = window.get("resetAt").and_then(Value::as_i64);
+    let Some(reset_at) = reset_at else {
+        return QuotaRefreshForecast {
+            detail: format!("Cannot compare ETA {estimate} with refresh: reset time not reported."),
+            compact: "reset unknown".into(),
+            bar_label: "reset unknown".into(),
+        };
+    };
+    let Some(reset_date) = Local.timestamp_opt(reset_at, 0).single() else {
+        return QuotaRefreshForecast {
+            detail: format!("Cannot compare ETA {estimate} with refresh: invalid reset time."),
+            compact: "invalid reset".into(),
+            bar_label: "reset unknown".into(),
+        };
+    };
+    if reset_at <= now_seconds {
+        return QuotaRefreshForecast {
+            detail: format!(
+                "Quota refresh is due or past ({})—waiting for a fresh quota reading.",
+                reset_date.format("%Y-%m-%d %H:%M")
+            ),
+            compact: "refresh due".into(),
+            bar_label: "refresh due".into(),
+        };
+    }
+    let reset_label = reset_date.format("%Y-%m-%d %H:%M").to_string();
+    let refresh_delta = reset_at.saturating_sub(now_seconds);
+
+    if estimate == "collecting samples" {
+        return QuotaRefreshForecast {
+            detail: format!(
+                "Cannot tell whether quota will last to refresh at {reset_label}: collecting usage samples."
+            ),
+            compact: "collecting samples".into(),
+            bar_label: "collecting ETA".into(),
+        };
+    }
+    if estimate == "no drawdown" {
+        return QuotaRefreshForecast {
+            detail: format!(
+                "No runout is currently projected before refresh at {reset_label}; no recent drawdown was observed."
+            ),
+            compact: "no drawdown".into(),
+            bar_label: "no drawdown".into(),
+        };
+    }
+    if estimate == "unavailable" {
+        return QuotaRefreshForecast {
+            detail: format!(
+                "Cannot assess runout before refresh at {reset_label}: ETA unavailable."
+            ),
+            compact: "ETA unavailable".into(),
+            bar_label: "ETA unavailable".into(),
+        };
+    }
+    if estimate == ">10y" {
+        let ten_years = 10 * 365 * 24 * 60 * 60;
+        return if refresh_delta <= ten_years {
+            QuotaRefreshForecast {
+                detail: format!(
+                    "No runout is projected before refresh at {reset_label} (current ETA is over 10 years)."
+                ),
+                compact: "after refresh (ETA >10y)".into(),
+                bar_label: "after refresh".into(),
+            }
+        } else {
+            QuotaRefreshForecast {
+                detail: format!(
+                    "Current ETA is over 10 years; it cannot be compared reliably with distant refresh at {reset_label}."
+                ),
+                compact: "ETA >10y".into(),
+                bar_label: "ETA >10y".into(),
+            }
+        };
+    }
+    if estimate == "<1m" {
+        return if refresh_delta > 60 {
+            QuotaRefreshForecast {
+                detail: format!(
+                    "Projected to run out within 1 minute, before quota refresh at {reset_label}."
+                ),
+                compact: "runs out <1m".into(),
+                bar_label: "before refresh <1m".into(),
+            }
+        } else {
+            QuotaRefreshForecast {
+                detail: format!(
+                    "ETA is under 1 minute and quota refreshes at {reset_label}; depletion may occur just before refresh."
+                ),
+                compact: "ETA <1m near refresh".into(),
+                bar_label: "near refresh".into(),
+            }
+        };
+    }
+
+    let Some(eta_seconds) = parse_runout_eta_seconds(estimate) else {
+        return QuotaRefreshForecast {
+            detail: format!("Cannot compare ETA {estimate} with refresh at {reset_label}."),
+            compact: format!("ETA {estimate}; comparison unavailable"),
+            bar_label: "ETA unknown".into(),
+        };
+    };
+    let runout_at = now_seconds.saturating_add(eta_seconds);
+    let Some(runout_date) = Local.timestamp_opt(runout_at, 0).single() else {
+        return QuotaRefreshForecast {
+            detail: format!("Cannot compare ETA {estimate} with refresh at {reset_label}."),
+            compact: format!("ETA {estimate}; comparison unavailable"),
+            bar_label: "ETA unknown".into(),
+        };
+    };
+    let runout_label = runout_date.format("%Y-%m-%d %H:%M").to_string();
+    if runout_at <= reset_at {
+        QuotaRefreshForecast {
+            detail: format!(
+                "Projected to run out before quota refresh at {runout_label} (refresh {reset_label}; current ETA {estimate})."
+            ),
+            compact: format!("runs out ~{} before refresh", runout_date.format("%H:%M")),
+            bar_label: format!("before refresh ~{}", runout_date.format("%H:%M")),
+        }
+    } else {
+        QuotaRefreshForecast {
+            detail: format!(
+                "No runout is projected before refresh at {reset_label}; current ETA {estimate} points to {runout_label}."
+            ),
+            compact: format!("after refresh (ETA {estimate})"),
+            bar_label: "after refresh".into(),
+        }
+    }
+}
+
+fn parse_runout_eta_seconds(estimate: &str) -> Option<i64> {
+    let estimate = estimate.strip_prefix('~')?;
+    let mut total = 0i64;
+    for component in estimate.split_whitespace() {
+        let (amount, unit) = component.split_at(component.len().checked_sub(1)?);
+        let amount = amount.parse::<i64>().ok()?;
+        if amount < 0 {
+            return None;
+        }
+        let multiplier = match unit {
+            "m" => 60,
+            "h" => 60 * 60,
+            "d" => 24 * 60 * 60,
+            _ => return None,
+        };
+        total = total.checked_add(amount.checked_mul(multiplier)?)?;
+    }
+    (total > 0).then_some(total)
+}
+
 fn format_quota_sample_span(span_ms: i64) -> String {
     let minutes = span_ms.max(0) / 60_000;
     if minutes < 60 {
@@ -724,6 +905,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         .and_then(|quota| quota.get("tokenBasedBilling"))
         .and_then(Value::as_bool)
         == Some(true);
+    let now_seconds = Utc::now().timestamp();
     let mut groups = Vec::new();
     for window in windows {
         let unlimited = window
@@ -778,6 +960,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             .get("runoutEstimate")
             .and_then(Value::as_str)
             .unwrap_or("unavailable");
+        let forecast = quota_refresh_forecast(window, runout, now_seconds);
         let basis = quota_runout_basis(window, runout)
             .map(|basis| format!(" · {basis}"))
             .unwrap_or_default();
@@ -786,6 +969,11 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         } else {
             format!("Remaining: {remaining} · ETA: {runout}{basis}")
         };
+        let forecast_line = if width >= 90 {
+            format!("Forecast vs refresh: {}", forecast.detail)
+        } else {
+            format!("Forecast: {}", forecast.compact)
+        };
         let lines = vec![
             format!("{name} · {unit} · reset: {reset}"),
             format!(
@@ -793,19 +981,26 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
                 quota_quantity(window.get("used"))
             ),
             remaining_line,
+            forecast_line,
         ];
         let lines = wrap_physical_lines(lines, width);
-        groups.push((lines, unlimited, used));
+        groups.push((lines, unlimited, used, forecast.bar_label));
     }
     let compact_required = groups
         .iter()
-        .map(|(lines, _, _)| lines.len().saturating_add(1))
+        .map(|(lines, unlimited, _, _)| lines.len().saturating_add(usize::from(!*unlimited)))
         .sum::<usize>()
         + usize::from(token_based);
     let boxed_required = groups
         .iter()
-        .map(|(lines, unlimited, used)| {
-            let gauge_height = if !unlimited && used.is_some() { 3 } else { 1 };
+        .map(|(lines, unlimited, used, _)| {
+            let gauge_height = if *unlimited {
+                0
+            } else if used.is_some() {
+                3
+            } else {
+                1
+            };
             lines.len().saturating_add(gauge_height)
         })
         .sum::<usize>()
@@ -821,8 +1016,10 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     }
     let mut constraints: Vec<_> = groups
         .iter()
-        .flat_map(|(lines, unlimited, used)| {
-            let gauge_height = if boxed_gauges && !unlimited && used.is_some() {
+        .flat_map(|(lines, unlimited, used, _)| {
+            let gauge_height = if *unlimited {
+                0
+            } else if boxed_gauges && used.is_some() {
                 3
             } else {
                 1
@@ -844,7 +1041,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         );
     }
     let start = usize::from(token_based);
-    for (index, (lines, unlimited, used)) in groups.into_iter().enumerate() {
+    for (index, (lines, unlimited, used, forecast_label)) in groups.into_iter().enumerate() {
         frame.render_widget(
             Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()),
             areas[start + index * 2],
@@ -870,7 +1067,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
                     })
                     .gauge_style(Style::default().fg(color))
                     .ratio(clamped / 100.0)
-                    .label(format!("{used}% used")),
+                    .label(format!("{used}% used · {forecast_label}")),
                 gauge_area,
             );
         } else {
@@ -2228,10 +2425,12 @@ mod tests {
     #[test]
     fn quota_shows_runout_eta_in_the_boxed_usage_gauge() {
         let null = Value::Null;
+        let reset_at = Utc::now().timestamp() + 4 * 24 * 60 * 60;
         let quota = json!({"windows":[{
             "name":"Premium",
             "usedPercent":41.6,
             "remaining":100,
+            "resetAt": reset_at,
             "runoutEstimate":"~2d 3h",
             "runoutEstimateSampleSpanMs": 6 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000,
             "runoutEstimateSampleCount": 84
@@ -2247,6 +2446,89 @@ mod tests {
         );
         assert!(display.contains("┌ Usage"), "{display}");
         assert!(display.contains("41.6% used"), "{display}");
+        assert!(
+            display.contains("Forecast vs refresh: Projected to run out before quota refresh")
+                || display.contains("before quota refresh"),
+            "{display}"
+        );
+        assert!(display.contains("before refresh ~"), "{display}");
+    }
+
+    #[test]
+    fn quota_refresh_forecast_compares_runout_with_refresh() {
+        let now = 1_800_000_000;
+        let before = json!({"resetAt": now + 4 * 24 * 60 * 60});
+        let forecast = quota_refresh_forecast(&before, "~2d 3h", now);
+        assert!(
+            forecast
+                .detail
+                .contains("Projected to run out before quota refresh")
+        );
+        assert!(forecast.bar_label.starts_with("before refresh ~"));
+
+        let after = json!({"resetAt": now + 24 * 60 * 60});
+        let forecast = quota_refresh_forecast(&after, "~2d 3h", now);
+        assert!(
+            forecast
+                .detail
+                .contains("No runout is projected before refresh")
+        );
+        assert_eq!(forecast.bar_label, "after refresh");
+    }
+
+    #[test]
+    fn quota_refresh_forecast_explains_uncertain_and_special_states() {
+        let now = 1_800_000_000;
+        let window = json!({"resetAt": now + 24 * 60 * 60});
+        for (estimate, detail, bar_label) in [
+            (
+                "collecting samples",
+                "collecting usage samples",
+                "collecting ETA",
+            ),
+            ("no drawdown", "no recent drawdown", "no drawdown"),
+            ("unavailable", "ETA unavailable", "ETA unavailable"),
+            (
+                "<1m",
+                "Projected to run out within 1 minute",
+                "before refresh <1m",
+            ),
+            ("already depleted", "already depleted", "depleted"),
+        ] {
+            let forecast = quota_refresh_forecast(&window, estimate, now);
+            assert!(
+                forecast.detail.contains(detail),
+                "{estimate}: {}",
+                forecast.detail
+            );
+            assert_eq!(forecast.bar_label, bar_label, "{estimate}");
+        }
+
+        let unlimited =
+            quota_refresh_forecast(&json!({"unlimited": true}), "collecting samples", now);
+        assert_eq!(unlimited.bar_label, "unlimited");
+
+        let due = quota_refresh_forecast(&json!({"resetAt": now}), "~1h", now);
+        assert_eq!(due.bar_label, "refresh due");
+
+        let missing_reset = quota_refresh_forecast(&json!({}), "~1h", now);
+        assert_eq!(missing_reset.bar_label, "reset unknown");
+    }
+
+    #[test]
+    fn runout_eta_parser_supports_reported_units() {
+        assert_eq!(parse_runout_eta_seconds("~12m"), Some(12 * 60));
+        assert_eq!(
+            parse_runout_eta_seconds("~2h 5m"),
+            Some(2 * 60 * 60 + 5 * 60)
+        );
+        assert_eq!(
+            parse_runout_eta_seconds("~2d 3h"),
+            Some(2 * 24 * 60 * 60 + 3 * 60 * 60)
+        );
+        for invalid in ["12m", "~0m", "~nope", "~2w", "~1h -2m", ""] {
+            assert_eq!(parse_runout_eta_seconds(invalid), None, "{invalid}");
+        }
     }
 
     #[test]

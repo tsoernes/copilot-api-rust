@@ -6,12 +6,25 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use futures_util::StreamExt;
 use reqwest::{Client, Url, redirect::Policy};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+fn quota_reset_timestamp(reset: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(reset)
+        .ok()
+        .map(|date| date.timestamp())
+        .or_else(|| {
+            NaiveDate::parse_from_str(reset, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|date: NaiveDateTime| date.and_utc().timestamp())
+        })
+}
 
 /// Fetches current quota information directly from GitHub on demand.
 /// The service does not maintain a local quota cache or estimate billing.
@@ -167,6 +180,9 @@ pub fn normalize_copilot_usage(value: Value) -> Result<Value> {
         }
         if let Some(ref reset) = usage.quota_reset_date {
             object.insert("resetDate".into(), json!(reset));
+            if let Some(reset_at) = quota_reset_timestamp(reset) {
+                object.insert("resetAt".into(), json!(reset_at));
+            }
         }
         windows.push(window);
     }
@@ -213,6 +229,10 @@ mod tests {
         assert_eq!(windows[0]["id"], "copilot:premium_interactions");
         assert_eq!(windows[0]["used"], 451.0);
         assert_eq!(windows[0]["resetDate"], "2026-11-01");
+        assert_eq!(
+            windows[0]["resetAt"], 1_793_491_200,
+            "date-only reset values are projected at the UTC day boundary"
+        );
         assert!((windows[0]["usedPercent"].as_f64().unwrap() - 30.1).abs() < 1e-10);
         assert_eq!(windows[1]["usedPercent"], 100.0);
         assert_eq!(windows[1]["limitReached"], true);
@@ -244,6 +264,16 @@ mod tests {
         );
         assert!(normalize_copilot_usage(json!({"copilot_plan":7})).is_err());
         assert!(QuotaClient::new("  ".into()).is_err());
+    }
+
+    #[test]
+    fn parses_date_only_and_precise_quota_reset_values() {
+        assert_eq!(quota_reset_timestamp("2026-11-01"), Some(1_793_491_200));
+        assert_eq!(
+            quota_reset_timestamp("2026-11-01T14:30:00+00:00"),
+            Some(1_793_543_400)
+        );
+        assert_eq!(quota_reset_timestamp("not-a-date"), None);
     }
 
     #[test]
