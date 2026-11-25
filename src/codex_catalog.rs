@@ -298,6 +298,15 @@ fn build_catalog(source: &Value, bundled: &Value) -> Result<BuiltCatalog> {
                 "experimental_supported_tools": [],
             })
         });
+        // MAI Code models use Codex-style freeform shell calls in practice, but
+        // GitHub's catalog does not provide a Codex template for them. Without
+        // an explicit tool mode Codex falls back to direct `exec_command`
+        // tools, while MAI emits the registered Code Mode tool name `exec` and
+        // the call is rejected locally as unsupported.
+        if id.to_ascii_lowercase().starts_with("mai-code") {
+            model["tool_mode"] = json!("code_mode_only");
+            model["apply_patch_tool_type"] = json!("freeform");
+        }
         let template_efforts = template
             .and_then(|value| value.get("supported_reasoning_levels"))
             .and_then(Value::as_array)
@@ -898,6 +907,11 @@ mod tests {
         ]);
         let built = build_catalog(&source, &json!({"models": []})).unwrap();
         assert_eq!(built.model_ids, ["MAI-Code-2-Flash"]);
+        assert_eq!(built.catalog["models"][0]["tool_mode"], "code_mode_only");
+        assert_eq!(
+            built.catalog["models"][0]["apply_patch_tool_type"],
+            "freeform"
+        );
         assert_eq!(built.excluded.len(), 3);
     }
 

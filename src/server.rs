@@ -504,6 +504,7 @@ struct PreparedPayload {
     initiator: &'static str,
     model: String,
     anthropic_beta: Option<String>,
+    stripped_opaque_reasoning: usize,
 }
 
 impl PreparedPayload {
@@ -514,8 +515,60 @@ impl PreparedPayload {
             initiator: "user",
             model: "unknown".into(),
             anthropic_beta: None,
+            stripped_opaque_reasoning: 0,
         }
     }
+}
+
+fn strip_opaque_responses_state(value: &mut Value) -> usize {
+    fn strip(value: &mut Value) -> usize {
+        match value {
+            Value::Array(values) => values.iter_mut().map(strip).sum(),
+            Value::Object(object) => {
+                let mut removed = usize::from(object.remove("encrypted_content").is_some());
+                for child in object.values_mut() {
+                    removed = removed.saturating_add(strip(child));
+                }
+                removed
+            }
+            _ => 0,
+        }
+    }
+
+    let mut removed = 0usize;
+    if let Some(input) = value.get_mut("input") {
+        removed = removed.saturating_add(strip(input));
+        if let Some(items) = input.as_array_mut() {
+            let original = items.len();
+            items.retain(|item| {
+                let is_reasoning = item.get("type").and_then(Value::as_str) == Some("reasoning");
+                let has_summary = item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .is_some_and(|summary| !summary.is_empty());
+                let has_content = item
+                    .get("content")
+                    .is_some_and(|content| !content.is_null())
+                    && item.get("content").is_some_and(|content| {
+                        !content.is_array()
+                            || content
+                                .as_array()
+                                .is_some_and(|content| !content.is_empty())
+                    });
+                !is_reasoning || has_summary || has_content
+            });
+            removed = removed.saturating_add(original.saturating_sub(items.len()));
+        }
+    }
+    if let Some(include) = value.get_mut("include").and_then(Value::as_array_mut) {
+        let original = include.len();
+        include.retain(|item| {
+            item.as_str() != Some("reasoning.encrypted_content")
+                && item.as_str() != Some("encrypted_content")
+        });
+        removed = removed.saturating_add(original.saturating_sub(include.len()));
+    }
+    removed
 }
 
 fn prepare_payload(path: &str, body: Bytes, headers: &HeaderMap) -> Result<PreparedPayload, ()> {
@@ -570,7 +623,7 @@ fn prepare_payload(path: &str, body: Bytes, headers: &HeaderMap) -> Result<Prepa
             _ => "agent",
         };
     }
-    if path == "/responses" {
+    let stripped_opaque_reasoning = if path == "/responses" {
         let object = value.as_object_mut().ok_or(())?;
         object.remove("service_tier");
         if let Some(n) = object.get("max_output_tokens").and_then(Value::as_u64)
@@ -579,7 +632,10 @@ fn prepare_payload(path: &str, body: Bytes, headers: &HeaderMap) -> Result<Prepa
         {
             object.insert("max_output_tokens".into(), json!(16));
         }
-    }
+        strip_opaque_responses_state(&mut value)
+    } else {
+        0
+    };
     let body = Bytes::from(serde_json::to_vec(&value).map_err(|_| ())?);
     Ok(PreparedPayload {
         body,
@@ -587,6 +643,7 @@ fn prepare_payload(path: &str, body: Bytes, headers: &HeaderMap) -> Result<Prepa
         initiator,
         model,
         anthropic_beta: beta,
+        stripped_opaque_reasoning,
     })
 }
 
@@ -626,9 +683,18 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         initiator,
         model,
         anthropic_beta,
+        stripped_opaque_reasoning,
     } = prepared;
     let id = Uuid::new_v4().to_string();
     let started = Instant::now();
+    if stripped_opaque_reasoning > 0 {
+        tracing::debug!(
+            request_id = %id,
+            endpoint = %path,
+            stripped_opaque_fields = stripped_opaque_reasoning,
+            "stripped provider-specific encrypted Responses state from request"
+        );
+    }
     let endpoint = match path.as_str() {
         "/chat/completions" => Some("chat_completions"),
         "/responses" => Some("responses"),
@@ -985,6 +1051,25 @@ mod tests {
             .is_err()
         );
         assert_eq!(upstream_path("/v1/responses"), "/responses");
+    }
+
+    #[test]
+    fn responses_strip_provider_specific_encrypted_reasoning_state() {
+        let prepared = prepare_payload(
+            "/responses",
+            Bytes::from_static(
+                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
+            ),
+            &HeaderMap::new(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(prepared.stripped_opaque_reasoning, 4);
+        assert_eq!(parsed["include"], json!(["usage"]));
+        assert_eq!(parsed["input"].as_array().unwrap().len(), 2);
+        assert!(parsed.to_string().contains("rs_visible"));
+        assert!(!parsed.to_string().contains("secret-state"));
+        assert!(!parsed.to_string().contains("rs_opaque"));
     }
 
     #[test]

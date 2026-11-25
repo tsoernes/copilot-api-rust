@@ -17,6 +17,7 @@ pub struct ObservedUsage {
     pub total_nano_aiu: Option<i64>,
     pub first_token_ms: Option<i64>,
     pub protocol_error: bool,
+    pub provider_error_code: Option<String>,
     pub terminal: Option<StreamTerminal>,
     pub monthly_quota_exceeded: bool,
     /// Optional provider-reported nested token subcounts; may overlap totals.
@@ -254,6 +255,13 @@ impl UsageObserver {
                 && value.pointer("/response/status").and_then(Value::as_str) == Some("failed"));
         if current_error {
             self.usage.protocol_error = true;
+            self.usage.provider_error_code = value
+                .pointer("/error/code")
+                .or_else(|| value.pointer("/response/error/code"))
+                .or_else(|| value.get("code"))
+                .and_then(Value::as_str)
+                .map(safe_error_code)
+                .filter(|code| !code.is_empty());
             let message = value
                 .pointer("/error/message")
                 .or_else(|| value.pointer("/response/error/message"))
@@ -419,6 +427,13 @@ impl UsageObserver {
     }
 }
 
+fn safe_error_code(code: &str) -> String {
+    code.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+        .take(64)
+        .collect()
+}
+
 fn assign(target: &mut Option<i64>, value: Option<i64>) {
     if value.is_some() {
         *target = value;
@@ -545,6 +560,25 @@ mod tests {
         assert_eq!(result.total_nano_aiu, Some(9));
         assert!(result.first_token_ms.is_some());
         assert!(result.protocol_error);
+        assert_eq!(result.provider_error_code, None);
+    }
+
+    #[test]
+    fn protocol_errors_preserve_only_bounded_safe_provider_codes() {
+        let mut observer = UsageObserver::new("responses", true, Instant::now());
+        observer.observe(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_request_body\",\"message\":\"sensitive detail\"}}}\n\n",
+        );
+        let result = observer.finish().unwrap();
+        assert!(result.protocol_error);
+        assert_eq!(
+            result.provider_error_code.as_deref(),
+            Some("invalid_request_body")
+        );
+
+        let unsafe_code = format!("safe_code_{}!secret", "x".repeat(80));
+        assert_eq!(safe_error_code(&unsafe_code).len(), 64);
+        assert!(!safe_error_code(&unsafe_code).contains('!'));
     }
 
     #[test]

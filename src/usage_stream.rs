@@ -69,6 +69,19 @@ impl UsageStream {
         let protocol_error = observed
             .as_ref()
             .is_some_and(|observed| observed.protocol_error);
+        if protocol_error {
+            let provider_error_code = observed
+                .as_ref()
+                .and_then(|observed| observed.provider_error_code.as_deref())
+                .unwrap_or("unknown");
+            tracing::warn!(
+                request_id = event.request_id.as_deref().unwrap_or("unknown"),
+                endpoint = %event.endpoint,
+                model = %event.model,
+                provider_error_code,
+                "Copilot returned a protocol error event"
+            );
+        }
         if let Some(observed) = observed.take() {
             event.input_tokens = observed.input_tokens.unwrap_or(0);
             event.output_tokens = observed.output_tokens.unwrap_or(0);
