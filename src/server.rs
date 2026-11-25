@@ -570,6 +570,9 @@ fn strip_opaque_responses_state(value: &mut Value) -> usize {
                         .is_some_and(|content| !content.is_empty());
                     return (removed, has_summary || has_content);
                 }
+                removed = removed.saturating_add(usize::from(
+                    object.remove("encrypted_function_args").is_some(),
+                ));
                 if object.contains_key("encrypted_content") {
                     // Opaque wrapper types cannot be made valid by deleting a
                     // required field. Drop the containing content item instead.
@@ -1092,19 +1095,22 @@ mod tests {
         let prepared = prepare_payload(
             "/responses",
             Bytes::from_static(
-                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"agent_message","author":"/root","recipient":"/root","content":[{"type":"input_text","text":"visible"},{"type":"encrypted_content","encrypted_content":"nested-secret"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
+                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"agent_message","author":"/root","recipient":"/root","content":[{"type":"input_text","text":"visible"},{"type":"encrypted_content","encrypted_content":"nested-secret"}]},{"type":"function_call","name":"exec","arguments":"pwd","call_id":"call-1","encrypted_function_args":["portable-secret"]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
             ),
             &HeaderMap::new(),
         )
         .unwrap();
         let parsed: Value = serde_json::from_slice(&prepared.body).unwrap();
-        assert_eq!(prepared.stripped_opaque_reasoning, 6);
+        assert_eq!(prepared.stripped_opaque_reasoning, 7);
         assert_eq!(parsed["include"], json!(["usage"]));
-        assert_eq!(parsed["input"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["input"].as_array().unwrap().len(), 4);
         assert!(parsed.to_string().contains("rs_visible"));
         assert!(parsed.to_string().contains("visible"));
         assert!(!parsed.to_string().contains("secret-state"));
         assert!(!parsed.to_string().contains("nested-secret"));
+        assert!(!parsed.to_string().contains("portable-secret"));
+        assert!(parsed.to_string().contains("\"arguments\":\"pwd\""));
+        assert!(!parsed.to_string().contains("encrypted_function_args"));
         assert!(!parsed.to_string().contains("rs_opaque"));
         assert!(!parsed.to_string().contains("encrypted_content"));
     }
