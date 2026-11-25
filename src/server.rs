@@ -521,44 +521,78 @@ impl PreparedPayload {
 }
 
 fn strip_opaque_responses_state(value: &mut Value) -> usize {
-    fn strip(value: &mut Value) -> usize {
+    fn sanitize(value: &mut Value) -> (usize, bool) {
         match value {
-            Value::Array(values) => values.iter_mut().map(strip).sum(),
-            Value::Object(object) => {
-                let mut removed = usize::from(object.remove("encrypted_content").is_some());
-                for child in object.values_mut() {
-                    removed = removed.saturating_add(strip(child));
-                }
-                removed
+            Value::Array(values) => {
+                let mut removed = 0usize;
+                let original = values.len();
+                values.retain_mut(|value| {
+                    let (count, keep) = sanitize(value);
+                    removed = removed.saturating_add(count);
+                    keep
+                });
+                removed = removed.saturating_add(original.saturating_sub(values.len()));
+                (removed, true)
             }
-            _ => 0,
+            Value::Object(object) => {
+                let item_type = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if item_type.as_deref() == Some("encrypted_content") {
+                    return (1, false);
+                }
+                if matches!(
+                    item_type.as_deref(),
+                    Some("compaction" | "compaction_summary" | "context_compaction")
+                ) {
+                    return (1, false);
+                }
+
+                let mut removed = 0usize;
+                for child in object.values_mut() {
+                    let (count, keep) = sanitize(child);
+                    removed = removed.saturating_add(count);
+                    if !keep {
+                        *child = Value::Null;
+                    }
+                }
+                if item_type.as_deref() == Some("reasoning") {
+                    removed = removed
+                        .saturating_add(usize::from(object.remove("encrypted_content").is_some()));
+                    let has_summary = object
+                        .get("summary")
+                        .and_then(Value::as_array)
+                        .is_some_and(|summary| !summary.is_empty());
+                    let has_content = object
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|content| !content.is_empty());
+                    return (removed, has_summary || has_content);
+                }
+                if object.contains_key("encrypted_content") {
+                    // Opaque wrapper types cannot be made valid by deleting a
+                    // required field. Drop the containing content item instead.
+                    return (removed.saturating_add(1), false);
+                }
+                if item_type.as_deref() == Some("agent_message")
+                    && object
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(Vec::is_empty)
+                {
+                    return (removed.saturating_add(1), false);
+                }
+                (removed, true)
+            }
+            _ => (0, true),
         }
     }
 
     let mut removed = 0usize;
     if let Some(input) = value.get_mut("input") {
-        removed = removed.saturating_add(strip(input));
-        if let Some(items) = input.as_array_mut() {
-            let original = items.len();
-            items.retain(|item| {
-                let is_reasoning = item.get("type").and_then(Value::as_str) == Some("reasoning");
-                let has_summary = item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .is_some_and(|summary| !summary.is_empty());
-                let has_content = item
-                    .get("content")
-                    .is_some_and(|content| !content.is_null())
-                    && item.get("content").is_some_and(|content| {
-                        !content.is_array()
-                            || content
-                                .as_array()
-                                .is_some_and(|content| !content.is_empty())
-                    });
-                !is_reasoning || has_summary || has_content
-            });
-            removed = removed.saturating_add(original.saturating_sub(items.len()));
-        }
+        let (count, _) = sanitize(input);
+        removed = removed.saturating_add(count);
     }
     if let Some(include) = value.get_mut("include").and_then(Value::as_array_mut) {
         let original = include.len();
@@ -1058,18 +1092,21 @@ mod tests {
         let prepared = prepare_payload(
             "/responses",
             Bytes::from_static(
-                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
+                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"agent_message","author":"/root","recipient":"/root","content":[{"type":"input_text","text":"visible"},{"type":"encrypted_content","encrypted_content":"nested-secret"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
             ),
             &HeaderMap::new(),
         )
         .unwrap();
         let parsed: Value = serde_json::from_slice(&prepared.body).unwrap();
-        assert_eq!(prepared.stripped_opaque_reasoning, 4);
+        assert_eq!(prepared.stripped_opaque_reasoning, 6);
         assert_eq!(parsed["include"], json!(["usage"]));
-        assert_eq!(parsed["input"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["input"].as_array().unwrap().len(), 3);
         assert!(parsed.to_string().contains("rs_visible"));
+        assert!(parsed.to_string().contains("visible"));
         assert!(!parsed.to_string().contains("secret-state"));
+        assert!(!parsed.to_string().contains("nested-secret"));
         assert!(!parsed.to_string().contains("rs_opaque"));
+        assert!(!parsed.to_string().contains("encrypted_content"));
     }
 
     #[test]
