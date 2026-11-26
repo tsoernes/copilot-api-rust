@@ -744,6 +744,26 @@ fn strip_opaque_responses_state(value: &mut Value) -> usize {
 
     let mut removed = 0usize;
     if let Some(input) = value.get_mut("input") {
+        let historical_tool_cutoff = input.as_array().and_then(|items| {
+            items.iter().rposition(|item| {
+                item.get("type").and_then(Value::as_str) == Some("message")
+                    && item.get("role").and_then(Value::as_str) == Some("user")
+            })
+        });
+        if let (Some(cutoff), Some(items)) = (historical_tool_cutoff, input.as_array_mut()) {
+            let original = items.len();
+            let mut index = 0usize;
+            items.retain(|item| {
+                let keep = index >= cutoff
+                    || !item
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.ends_with("_call") || kind.ends_with("_output"));
+                index = index.saturating_add(1);
+                keep
+            });
+            removed = removed.saturating_add(original.saturating_sub(items.len()));
+        }
         // Codex can preserve a function call from another provider in a
         // long-lived transcript.  Non-empty encrypted_function_args mean its
         // plaintext-looking `arguments` field is not portable either: the
@@ -1271,7 +1291,7 @@ mod tests {
         let prepared = prepare_payload(
             "/responses",
             Bytes::from_static(
-                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"agent_message","author":"/root","recipient":"/root","content":[{"type":"input_text","text":"visible"},{"type":"encrypted_content","encrypted_content":"nested-secret"}]},{"type":"function_call","name":"exec","arguments":"portable-looking-secret","call_id":"call-1","encrypted_function_args":["portable-secret"]},{"type":"function_call_output","call_id":"call-1","output":"secret-tool-output"},{"type":"wrapper","item":{"type":"custom_tool_call","name":"exec","input":"nested-looking-secret","call_id":"call-custom","encrypted_function_args":"nested-portable-secret"}},{"type":"custom_tool_call_output","call_id":"call-custom","output":"nested-secret-output"},{"type":"function_call","name":"read_file","arguments":"{\"path\":\"README.md\"}","call_id":"call-2","encrypted_function_args":[]},{"type":"function_call_output","call_id":"call-2","output":"visible output"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
+                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"agent_message","author":"/root","recipient":"/root","content":[{"type":"input_text","text":"visible"},{"type":"encrypted_content","encrypted_content":"nested-secret"}]},{"type":"function_call","name":"exec","arguments":"portable-looking-secret","call_id":"call-1","encrypted_function_args":["portable-secret"]},{"type":"function_call_output","call_id":"call-1","output":"secret-tool-output"},{"type":"wrapper","item":{"type":"custom_tool_call","name":"exec","input":"nested-looking-secret","call_id":"call-custom","encrypted_function_args":"nested-portable-secret"}},{"type":"custom_tool_call_output","call_id":"call-custom","output":"nested-secret-output"},{"type":"function_call","name":"legacy_exec","arguments":"marker-already-erased","call_id":"call-stale"},{"type":"function_call_output","call_id":"call-stale","output":"stale-tool-output"},{"type":"function_call","name":"read_file","arguments":"{\"path\":\"README.md\"}","call_id":"call-2","encrypted_function_args":[]},{"type":"function_call_output","call_id":"call-2","output":"visible output"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
             ),
             &HeaderMap::new(),
         )
@@ -1290,11 +1310,14 @@ mod tests {
         assert!(!parsed.to_string().contains("nested-looking-secret"));
         assert!(!parsed.to_string().contains("nested-portable-secret"));
         assert!(!parsed.to_string().contains("nested-secret-output"));
+        assert!(!parsed.to_string().contains("marker-already-erased"));
+        assert!(!parsed.to_string().contains("stale-tool-output"));
         assert!(parsed.to_string().contains("README.md"));
         assert!(parsed.to_string().contains("visible output"));
         assert!(parsed.to_string().contains("call-2"));
         assert!(!parsed.to_string().contains("call-1"));
         assert!(!parsed.to_string().contains("call-custom"));
+        assert!(!parsed.to_string().contains("call-stale"));
         assert!(!parsed.to_string().contains("encrypted_function_args"));
         assert!(!parsed.to_string().contains("rs_opaque"));
         assert!(!parsed.to_string().contains("encrypted_content"));
