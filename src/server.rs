@@ -633,6 +633,36 @@ impl PreparedPayload {
 }
 
 fn strip_opaque_responses_state(value: &mut Value) -> usize {
+    fn has_portable_encrypted_function_args(object: &serde_json::Map<String, Value>) -> bool {
+        match object.get("encrypted_function_args") {
+            Some(Value::Array(values)) => !values.is_empty(),
+            Some(Value::String(value)) => !value.is_empty(),
+            Some(Value::Null) | None => false,
+            Some(_) => true,
+        }
+    }
+
+    fn collect_portable_call_ids(value: &Value, call_ids: &mut std::collections::BTreeSet<String>) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    collect_portable_call_ids(value, call_ids);
+                }
+            }
+            Value::Object(object) => {
+                if has_portable_encrypted_function_args(object)
+                    && let Some(call_id) = object.get("call_id").and_then(Value::as_str)
+                {
+                    call_ids.insert(call_id.to_owned());
+                }
+                for value in object.values() {
+                    collect_portable_call_ids(value, call_ids);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn sanitize(value: &mut Value) -> (usize, bool) {
         match value {
             Value::Array(values) => {
@@ -652,6 +682,14 @@ fn strip_opaque_responses_state(value: &mut Value) -> usize {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 if item_type.as_deref() == Some("encrypted_content") {
+                    return (1, false);
+                }
+                if has_portable_encrypted_function_args(object) {
+                    // Do not preserve the apparently readable `arguments` or
+                    // `input`: portable encrypted state means the whole call is
+                    // provider-owned and can only be decoded with its original
+                    // tool declaration/schema.  This applies to function and
+                    // custom-tool call variants, including nested wrappers.
                     return (1, false);
                 }
                 if matches!(
@@ -712,35 +750,18 @@ fn strip_opaque_responses_state(value: &mut Value) -> usize {
         // receiving provider still needs the original declaration or saved
         // encryption schema.  Removing only the marker leaves an unusable
         // call, so remove the call and its matching output atomically.
-        let opaque_call_ids = input
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|item| {
-                item.get("type").and_then(Value::as_str) == Some("function_call")
-                    && item
-                        .get("encrypted_function_args")
-                        .and_then(Value::as_array)
-                        .is_some_and(|arguments| !arguments.is_empty())
-            })
-            .filter_map(|item| item.get("call_id").and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect::<std::collections::BTreeSet<_>>();
+        let mut opaque_call_ids = std::collections::BTreeSet::new();
+        collect_portable_call_ids(input, &mut opaque_call_ids);
         if let Some(items) = input.as_array_mut() {
             let original = items.len();
             items.retain(|item| {
                 let item_type = item.get("type").and_then(Value::as_str);
-                let opaque_call = item_type == Some("function_call")
-                    && item
-                        .get("encrypted_function_args")
-                        .and_then(Value::as_array)
-                        .is_some_and(|arguments| !arguments.is_empty());
-                let opaque_output = item_type == Some("function_call_output")
+                let opaque_output = item_type.is_some_and(|kind| kind.ends_with("_output"))
                     && item
                         .get("call_id")
                         .and_then(Value::as_str)
                         .is_some_and(|call_id| opaque_call_ids.contains(call_id));
-                !opaque_call && !opaque_output
+                !opaque_output
             });
             removed = removed.saturating_add(original.saturating_sub(items.len()));
         }
@@ -1250,15 +1271,15 @@ mod tests {
         let prepared = prepare_payload(
             "/responses",
             Bytes::from_static(
-                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"agent_message","author":"/root","recipient":"/root","content":[{"type":"input_text","text":"visible"},{"type":"encrypted_content","encrypted_content":"nested-secret"}]},{"type":"function_call","name":"exec","arguments":"portable-looking-secret","call_id":"call-1","encrypted_function_args":["portable-secret"]},{"type":"function_call_output","call_id":"call-1","output":"secret-tool-output"},{"type":"function_call","name":"read_file","arguments":"{\"path\":\"README.md\"}","call_id":"call-2","encrypted_function_args":[]},{"type":"function_call_output","call_id":"call-2","output":"visible output"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
+                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"agent_message","author":"/root","recipient":"/root","content":[{"type":"input_text","text":"visible"},{"type":"encrypted_content","encrypted_content":"nested-secret"}]},{"type":"function_call","name":"exec","arguments":"portable-looking-secret","call_id":"call-1","encrypted_function_args":["portable-secret"]},{"type":"function_call_output","call_id":"call-1","output":"secret-tool-output"},{"type":"wrapper","item":{"type":"custom_tool_call","name":"exec","input":"nested-looking-secret","call_id":"call-custom","encrypted_function_args":"nested-portable-secret"}},{"type":"custom_tool_call_output","call_id":"call-custom","output":"nested-secret-output"},{"type":"function_call","name":"read_file","arguments":"{\"path\":\"README.md\"}","call_id":"call-2","encrypted_function_args":[]},{"type":"function_call_output","call_id":"call-2","output":"visible output"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
             ),
             &HeaderMap::new(),
         )
         .unwrap();
         let parsed: Value = serde_json::from_slice(&prepared.body).unwrap();
-        assert_eq!(prepared.stripped_opaque_reasoning, 9);
+        assert_eq!(prepared.stripped_opaque_reasoning, 13);
         assert_eq!(parsed["include"], json!(["usage"]));
-        assert_eq!(parsed["input"].as_array().unwrap().len(), 5);
+        assert_eq!(parsed["input"].as_array().unwrap().len(), 4);
         assert!(parsed.to_string().contains("rs_visible"));
         assert!(parsed.to_string().contains("visible"));
         assert!(!parsed.to_string().contains("secret-state"));
@@ -1266,10 +1287,14 @@ mod tests {
         assert!(!parsed.to_string().contains("portable-secret"));
         assert!(!parsed.to_string().contains("portable-looking-secret"));
         assert!(!parsed.to_string().contains("secret-tool-output"));
+        assert!(!parsed.to_string().contains("nested-looking-secret"));
+        assert!(!parsed.to_string().contains("nested-portable-secret"));
+        assert!(!parsed.to_string().contains("nested-secret-output"));
         assert!(parsed.to_string().contains("README.md"));
         assert!(parsed.to_string().contains("visible output"));
         assert!(parsed.to_string().contains("call-2"));
         assert!(!parsed.to_string().contains("call-1"));
+        assert!(!parsed.to_string().contains("call-custom"));
         assert!(!parsed.to_string().contains("encrypted_function_args"));
         assert!(!parsed.to_string().contains("rs_opaque"));
         assert!(!parsed.to_string().contains("encrypted_content"));
