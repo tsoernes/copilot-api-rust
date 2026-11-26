@@ -501,8 +501,10 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &CatalogView<'_>) 
     let list_height = (area.height / 3).clamp(5, 10);
     let sections =
         Layout::vertical([Constraint::Length(list_height), Constraint::Min(3)]).split(area);
-    let visible = usize::from(sections[0].height.saturating_sub(4));
-    let start = selected.saturating_sub(visible.saturating_sub(1));
+    // The three status/filter/metric lines and border share the list pane;
+    // reserve them explicitly so the selected model can never fall below it.
+    let visible_models = usize::from(sections[0].height.saturating_sub(5));
+    let start = selected.saturating_sub(visible_models.saturating_sub(1));
     let title = format!("Catalog · {} / {}", selected + 1, models.len());
     let metric = match view.sort_key {
         SortKey::Input => "Input: GitHub ref credits/1M",
@@ -526,7 +528,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, view: &CatalogView<'_>) 
             .iter()
             .enumerate()
             .skip(start)
-            .take(visible)
+            .take(visible_models)
             .map(|(i, m)| {
                 let marker = if i == selected { "> " } else { "  " };
                 let key = match view.sort_key {
