@@ -744,6 +744,26 @@ fn strip_opaque_responses_state(value: &mut Value) -> usize {
 
     let mut removed = 0usize;
     if let Some(input) = value.get_mut("input") {
+        // Responses Lite prepends a fresh portable AdditionalTools declaration
+        // on every request. Codex also retains the declarations from previous
+        // turns, which can describe tools encrypted for a different model or
+        // provider. Keep only the first declaration (the freshly generated
+        // request prefix) and discard historical copies.
+        if let Some(items) = input.as_array_mut() {
+            let mut seen_declaration = false;
+            let original = items.len();
+            items.retain(|item| {
+                if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                    return true;
+                }
+                if seen_declaration {
+                    return false;
+                }
+                seen_declaration = true;
+                true
+            });
+            removed = removed.saturating_add(original.saturating_sub(items.len()));
+        }
         let historical_tool_cutoff = input.as_array().and_then(|items| {
             items.iter().rposition(|item| {
                 item.get("type").and_then(Value::as_str) == Some("message")
@@ -1291,15 +1311,25 @@ mod tests {
         let prepared = prepare_payload(
             "/responses",
             Bytes::from_static(
-                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"agent_message","author":"/root","recipient":"/root","content":[{"type":"input_text","text":"visible"},{"type":"encrypted_content","encrypted_content":"nested-secret"}]},{"type":"function_call","name":"exec","arguments":"portable-looking-secret","call_id":"call-1","encrypted_function_args":["portable-secret"]},{"type":"function_call_output","call_id":"call-1","output":"secret-tool-output"},{"type":"wrapper","item":{"type":"custom_tool_call","name":"exec","input":"nested-looking-secret","call_id":"call-custom","encrypted_function_args":"nested-portable-secret"}},{"type":"custom_tool_call_output","call_id":"call-custom","output":"nested-secret-output"},{"type":"function_call","name":"legacy_exec","arguments":"marker-already-erased","call_id":"call-stale"},{"type":"function_call_output","call_id":"call-stale","output":"stale-tool-output"},{"type":"function_call","name":"read_file","arguments":"{\"path\":\"README.md\"}","call_id":"call-2","encrypted_function_args":[]},{"type":"function_call_output","call_id":"call-2","output":"visible output"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
+                br#"{"model":"mai-code-2","include":["reasoning.encrypted_content","usage"],"input":[{"type":"reasoning","id":"rs_opaque","summary":[],"encrypted_content":"secret-state"},{"type":"reasoning","id":"rs_visible","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"secret-state-2"},{"type":"agent_message","author":"/root","recipient":"/root","content":[{"type":"input_text","text":"visible"},{"type":"encrypted_content","encrypted_content":"nested-secret"}]},{"type":"function_call","name":"exec","arguments":"portable-looking-secret","call_id":"call-1","encrypted_function_args":["portable-secret"]},{"type":"function_call_output","call_id":"call-1","output":"secret-tool-output"},{"type":"wrapper","item":{"type":"custom_tool_call","name":"exec","input":"nested-looking-secret","call_id":"call-custom","encrypted_function_args":"nested-portable-secret"}},{"type":"custom_tool_call_output","call_id":"call-custom","output":"nested-secret-output"},{"type":"additional_tools","role":"developer","tools":[]},{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"stale_tool_schema"}]},{"type":"function_call","name":"legacy_exec","arguments":"marker-already-erased","call_id":"call-stale"},{"type":"function_call_output","call_id":"call-stale","output":"stale-tool-output"},{"type":"function_call","name":"read_file","arguments":"{\"path\":\"README.md\"}","call_id":"call-2","encrypted_function_args":[]},{"type":"function_call_output","call_id":"call-2","output":"visible output"},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
             ),
             &HeaderMap::new(),
         )
         .unwrap();
         let parsed: Value = serde_json::from_slice(&prepared.body).unwrap();
-        assert_eq!(prepared.stripped_opaque_reasoning, 13);
+        assert_eq!(prepared.stripped_opaque_reasoning, 15);
         assert_eq!(parsed["include"], json!(["usage"]));
-        assert_eq!(parsed["input"].as_array().unwrap().len(), 4);
+        assert_eq!(parsed["input"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            parsed["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "additional_tools")
+                .count(),
+            1
+        );
+        assert!(!parsed.to_string().contains("stale_tool_schema"));
         assert!(parsed.to_string().contains("rs_visible"));
         assert!(parsed.to_string().contains("visible"));
         assert!(!parsed.to_string().contains("secret-state"));
@@ -1312,9 +1342,8 @@ mod tests {
         assert!(!parsed.to_string().contains("nested-secret-output"));
         assert!(!parsed.to_string().contains("marker-already-erased"));
         assert!(!parsed.to_string().contains("stale-tool-output"));
-        assert!(parsed.to_string().contains("README.md"));
-        assert!(parsed.to_string().contains("visible output"));
-        assert!(parsed.to_string().contains("call-2"));
+        // Both ordinary calls predate the newest user message, so stale
+        // tool history is deliberately not sent back to the provider.
         assert!(!parsed.to_string().contains("call-1"));
         assert!(!parsed.to_string().contains("call-custom"));
         assert!(!parsed.to_string().contains("call-stale"));
