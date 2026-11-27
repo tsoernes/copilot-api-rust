@@ -306,6 +306,12 @@ fn build_catalog(source: &Value, bundled: &Value) -> Result<BuiltCatalog> {
         if id.to_ascii_lowercase().starts_with("mai-code") {
             model["tool_mode"] = json!("code_mode_only");
             model["apply_patch_tool_type"] = json!("freeform");
+            // MAI follows the Codex Code Mode contract. Enable Responses Lite so
+            // tool declarations are replayed as a portable `additional_tools`
+            // input item instead of depending on encrypted tool schemas from
+            // historical Responses calls after a model/provider migration.
+            model["use_responses_lite"] = json!(true);
+            model["supports_search_tool"] = json!(true);
         }
         let template_efforts = template
             .and_then(|value| value.get("supported_reasoning_levels"))
@@ -908,6 +914,8 @@ mod tests {
         let built = build_catalog(&source, &json!({"models": []})).unwrap();
         assert_eq!(built.model_ids, ["MAI-Code-2-Flash"]);
         assert_eq!(built.catalog["models"][0]["tool_mode"], "code_mode_only");
+        assert_eq!(built.catalog["models"][0]["use_responses_lite"], true);
+        assert_eq!(built.catalog["models"][0]["supports_search_tool"], true);
         assert_eq!(
             built.catalog["models"][0]["apply_patch_tool_type"],
             "freeform"
