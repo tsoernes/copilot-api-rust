@@ -1017,7 +1017,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             format!("Forecast: {}", forecast.compact)
         };
         let lines = vec![
-            format!("{name} · {unit} · reset: {reset}"),
+            format!("{unit} · reset: {reset}"),
             format!(
                 "Used (derived): {} / Limit: {limit}",
                 quota_quantity(window.get("used"))
@@ -1034,11 +1034,11 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         } else {
             None
         };
-        groups.push((lines, unlimited, used, period_progress));
+        groups.push((name, lines, unlimited, used, period_progress));
     }
     let compact_required = groups
         .iter()
-        .map(|(lines, unlimited, _, period)| {
+        .map(|(_, lines, unlimited, _, period)| {
             let period_height = if period.is_some() { 3 } else { 0 };
             lines
                 .len()
@@ -1049,7 +1049,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         + usize::from(token_based);
     let boxed_required = groups
         .iter()
-        .map(|(lines, unlimited, used, period)| {
+        .map(|(_, lines, unlimited, used, period)| {
             let gauge_height = if *unlimited {
                 0
             } else if used.is_some() {
@@ -1075,7 +1075,7 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
     }
     let mut constraints: Vec<_> = groups
         .iter()
-        .flat_map(|(lines, unlimited, used, period)| {
+        .flat_map(|(_, lines, unlimited, used, period)| {
             let gauge_height = if !*unlimited && boxed_gauges && used.is_some() {
                 3
             } else {
@@ -1098,11 +1098,22 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
         );
     }
     let start = usize::from(token_based);
-    for (index, (lines, unlimited, used, period_progress)) in groups.into_iter().enumerate() {
-        frame.render_widget(
-            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()),
-            areas[start + index * 2],
-        );
+    for (index, (name, lines, unlimited, used, period_progress)) in groups.into_iter().enumerate() {
+        let section_lines = lines
+            .into_iter()
+            .enumerate()
+            .map(|(line_index, line)| {
+                if line_index == 0 {
+                    Line::from(Span::styled(
+                        format!("── {name} · {line}"),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(line)
+                }
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(section_lines), areas[start + index * 2]);
         let gauge_area = areas[start + index * 2 + 1];
         let usage_height = if boxed_gauges && !unlimited && used.is_some() {
             3
@@ -2591,14 +2602,14 @@ mod tests {
             let display = render_text(&terminal);
             for expected in [
                 "Token-based billing; unit unconfirmed",
-                "Premium",
+                "── Premium · units · reset:",
                 "Used (derived): 400 / Limit: 1,000",
                 "Remaining: 600.25",
                 "reset: 2026-12-01",
                 "40% used",
-                "Chat",
+                "── Chat · units · reset:",
                 "Limit: Unlimited",
-                "Completions",
+                "── Completions · units · reset:",
                 "Used (derived): 11 / Limit: 40",
                 "Remaining: —",
             ] {
