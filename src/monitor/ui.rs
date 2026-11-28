@@ -1145,8 +1145,8 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
                     } else {
                         Block::default()
                     })
-                    .style(Style::default().bg(Color::Black))
-                    .gauge_style(Style::default().fg(color).bg(Color::Black))
+                    .style(Style::default().bg(Color::Reset))
+                    .gauge_style(Style::default().fg(color).bg(Color::Reset))
                     .ratio(clamped / 100.0)
                     .label(Span::styled(
                         format!("{used}% used"),
@@ -1164,8 +1164,8 @@ fn quota(frame: &mut Frame<'_>, area: Rect, view: &View<'_>) {
             frame.render_widget(
                 Gauge::default()
                     .block(panel("Quota period · estimated"))
-                    .style(Style::default().bg(Color::Black))
-                    .gauge_style(Style::default().fg(ACCENT).bg(Color::Black))
+                    .style(Style::default().bg(Color::Reset))
+                    .gauge_style(Style::default().fg(ACCENT).bg(Color::Reset))
                     .ratio(progress.ratio)
                     .label(Span::styled(
                         format!(
@@ -2003,6 +2003,20 @@ mod tests {
         assert!(cell.modifier.contains(Modifier::BOLD));
     }
 
+    fn assert_gauge_track_uses_terminal_background(
+        terminal: &Terminal<TestBackend>,
+        display: &str,
+        label: &str,
+    ) {
+        let row = display
+            .lines()
+            .position(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("gauge label should be visible: {display}"));
+        let buffer = terminal.backend().buffer();
+        let track = &buffer[(buffer.area.width.saturating_sub(3), row as u16)];
+        assert_eq!(track.bg, Color::Reset, "unfilled track for {label}");
+    }
+
     #[test]
     fn displays_metrics_tabs_and_hides_credentials() {
         let summary = json!({"totals":{"total_tokens":42,"request_count":3,"input_tokens":30,"output_tokens":12,"cache_read_input_tokens":4,"cache_creation_input_tokens":2,"total_nano_aiu":100,"costs":[{"currency":"USD","amount":0.01}]},"byModel":[{"model":"gpt-thing","request_count":3,"total_tokens":42}]});
@@ -2665,6 +2679,7 @@ mod tests {
         assert!(display.contains("┌ Usage"), "{display}");
         assert!(display.contains("41.6% used"), "{display}");
         assert_high_contrast_label(&terminal, &display, "41.6% used");
+        assert_gauge_track_uses_terminal_background(&terminal, &display, "41.6% used");
         assert!(
             display.contains("Forecast vs refresh: Projected to run out before quota refresh")
                 || display.contains("before quota refresh"),
@@ -2699,6 +2714,7 @@ mod tests {
             .expect("period progress label should be rendered");
         assert_eq!(period_label_row, period_top + 1, "{display}");
         assert_high_contrast_label(&terminal, &display, &period_label);
+        assert_gauge_track_uses_terminal_background(&terminal, &display, &period_label);
     }
 
     #[test]
