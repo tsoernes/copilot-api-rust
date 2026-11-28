@@ -7,6 +7,7 @@
 - Rewrite the published Git history so it contains only Rust-project history, not the original non-Rust project. (User, 2026-11-21.)
 - Place the Rust crate at the repository root instead of keeping it in a `rust/` subdirectory. (User, 2026-11-21.)
 - Consider low memory usage, but do not over-optimize. (User, 2026-11-20.)
+- Keep the repository target directory reasonably small: disable dev/test debuginfo and incremental build artifacts, strip release symbols, and clean obsolete task-owned Cargo output rather than retaining many duplicate binaries. (User, 2026-11-28.)
 - Implement usage monitoring like the original project. (User, 2026-11-20.)
 - Implement GitHub sign-in if it is not already present. (User, 2026-11-20.)
 - Implement a rich terminal UI for monitoring. Start the server and dashboard together; prioritize an overview, quota, models and recent requests, with a five-second refresh. (User, 2026-11-20.)

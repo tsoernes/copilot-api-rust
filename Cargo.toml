@@ -40,3 +40,17 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+incremental = false
+
+[profile.test]
+debug = 0
+strip = "debuginfo"
+incremental = false
+
+[profile.release]
+strip = "symbols"
+incremental = false
