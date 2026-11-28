@@ -819,6 +819,18 @@ fn strip_opaque_responses_state(value: &mut Value) -> usize {
     removed
 }
 
+fn normalize_responses_reasoning_context(value: &mut Value) {
+    let Some(reasoning) = value.get_mut("reasoning").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if reasoning.get("context").and_then(Value::as_str) == Some("all_turns") {
+        // Responses Lite emits all_turns for its Codex/OpenAI path. GitHub
+        // Copilot's Responses backend accepts only auto and current_turn; the
+        // complete transcript is still carried in input.
+        reasoning.insert("context".into(), Value::String("current_turn".into()));
+    }
+}
+
 pub(crate) fn prepare_payload(
     path: &str,
     body: Bytes,
@@ -884,6 +896,7 @@ pub(crate) fn prepare_payload(
         {
             object.insert("max_output_tokens".into(), json!(16));
         }
+        normalize_responses_reasoning_context(&mut value);
         strip_opaque_responses_state(&mut value)
     } else {
         0
@@ -1304,6 +1317,31 @@ mod tests {
             .is_err()
         );
         assert_eq!(upstream_path("/v1/responses"), "/responses");
+    }
+
+    #[test]
+    fn responses_rewrite_unsupported_responses_lite_reasoning_context() {
+        let prepared = prepare_payload(
+            "/responses",
+            Bytes::from_static(
+                br#"{"model":"mai-code-2","reasoning":{"effort":"medium","context":"all_turns"}}"#,
+            ),
+            &HeaderMap::new(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(parsed["reasoning"]["context"], "current_turn");
+
+        let prepared = prepare_payload(
+            "/responses",
+            Bytes::from_static(
+                br#"{"model":"mai-code-2","reasoning":{"effort":"medium","context":"auto"}}"#,
+            ),
+            &HeaderMap::new(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(parsed["reasoning"]["context"], "auto");
     }
 
     #[test]
